@@ -272,13 +272,12 @@ Do not invent market data, candle times, or prices.
                 f"\n⏱️ مدة الصفقة: {duration}M"
             )
 
-                        await msg.edit_text(result)
+                                await msg.edit_text(result)
 
     except Exception:
         logging.exception("Analysis failed")
         await msg.edit_text(
-            "❌ تعذر تحليل الصورة الآن.\n"
-            "تأكد من إعداد GEMINI_API_KEY وأن الصورة واضحة."
+            "❌ تعذر تحليل الصورة الآن."
         )
 
 
