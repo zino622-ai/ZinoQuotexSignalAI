@@ -183,18 +183,46 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔎 جاري تحليل الصورة...")
+    msg = await update.message.reply_text("⚡ جاري تحليل الصورة بسرعة...")
 
     try:
+        algeria_time = datetime.now(ZoneInfo("Africa/Algiers"))
+        current_time = algeria_time.strftime("%H:%M")
+
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         data = await tg_file.download_as_bytearray()
 
         image = Image.open(io.BytesIO(data)).convert("RGB")
 
+        image.thumbnail((1600, 1600))
+
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
+        image.save(buffer, format="JPEG", quality=85, optimize=True)
         image_bytes = buffer.getvalue()
+
+        time_instruction = f"""
+CURRENT ALGERIA TIME: {current_time}
+
+Use this current Algeria time as the reference time.
+
+Your response MUST include:
+
+🕐 وقت الدخول: HH:MM
+⏱️ مدة الصفقة المقترحة: 1M / 2M / 5M / 15M
+
+Choose the most appropriate duration based ONLY on the visible chart timeframe, candle movement, momentum, and clarity.
+
+Do NOT assume that 2M is always the correct duration.
+
+If the chart does not provide enough evidence for a reliable entry, return:
+🎯 الإشارة: NO TRADE
+🕐 وقت الدخول: لا توجد
+⏱️ مدة الصفقة المقترحة: لا توجد
+
+The entry time must be based on the current Algeria time above.
+Do not give an old entry time from the screenshot.
+"""
 
         response = client.models.generate_content(
             model="gemini-3.6-flash",
@@ -203,11 +231,16 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data=image_bytes,
                     mime_type="image/jpeg"
                 ),
-                ANALYSIS_PROMPT
+                ANALYSIS_PROMPT,
+                time_instruction,
             ],
         )
 
         result = response.text.strip()
+
+        if not result:
+            result = "❌ لم يتم الحصول على تحليل واضح. أرسل صورة أوضح."
+
         await msg.edit_text(result)
 
     except Exception:
