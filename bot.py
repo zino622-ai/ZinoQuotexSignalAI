@@ -279,7 +279,7 @@ Do not invent market data, candle times, or prices.
         await msg.edit_text(
             "❌ تعذر تحليل الصورة الآن.\n"
             "تأكد من إعداد GEMINI_API_KEY وأن الصورة واضحة."
-    )."  )
+     ."  )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
