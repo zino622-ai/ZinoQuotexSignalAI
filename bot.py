@@ -183,45 +183,43 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⚡ جاري تحليل الصورة بسرعة...")
+    msg = await update.message.reply_text("⚡ جاري تحليل الصورة...")
 
     try:
-        algeria_time = datetime.now(ZoneInfo("Africa/Algiers"))
-        current_time = algeria_time.strftime("%H:%M")
-
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         data = await tg_file.download_as_bytearray()
 
         image = Image.open(io.BytesIO(data)).convert("RGB")
 
+        # تصغير الصورة لتسريع التحليل
         image.thumbnail((1600, 1600))
 
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=85, optimize=True)
         image_bytes = buffer.getvalue()
 
-        time_instruction = f"""
-CURRENT ALGERIA TIME: {current_time}
+        analysis_instruction = """
+IMPORTANT:
 
-Use this current Algeria time as the reference time.
+Analyze the chart first and determine:
+1. Direction: صاعد / هابط / غير واضح
+2. Signal: CALL / PUT / NO TRADE
+3. Recommended trade duration: 1M / 2M / 5M / 15M
+
+Do NOT provide an entry time based on the screenshot time.
+
+The Python program will calculate the future entry time after the analysis.
 
 Your response MUST include:
 
-🕐 وقت الدخول: HH:MM
 ⏱️ مدة الصفقة المقترحة: 1M / 2M / 5M / 15M
 
-Choose the most appropriate duration based ONLY on the visible chart timeframe, candle movement, momentum, and clarity.
-
-Do NOT assume that 2M is always the correct duration.
-
-If the chart does not provide enough evidence for a reliable entry, return:
+If there is not enough evidence for a valid trade:
 🎯 الإشارة: NO TRADE
-🕐 وقت الدخول: لا توجد
 ⏱️ مدة الصفقة المقترحة: لا توجد
 
-The entry time must be based on the current Algeria time above.
-Do not give an old entry time from the screenshot.
+Do not invent market data, candle times, or prices.
 """
 
         response = client.models.generate_content(
@@ -232,14 +230,47 @@ Do not give an old entry time from the screenshot.
                     mime_type="image/jpeg"
                 ),
                 ANALYSIS_PROMPT,
-                time_instruction,
+                analysis_instruction,
             ],
         )
 
         result = response.text.strip()
 
         if not result:
-            result = "❌ لم يتم الحصول على تحليل واضح. أرسل صورة أوضح."
+            result = "❌ لم يتم الحصول على تحليل واضح."
+
+        # وقت الجزائر الحالي
+        now = datetime.now(ZoneInfo("Africa/Algiers"))
+
+        # استخراج مدة الصفقة من نتيجة Gemini
+        duration = None
+
+        if "15M" in result:
+            duration = 15
+        elif "5M" in result:
+            duration = 5
+        elif "2M" in result:
+            duration = 2
+        elif "1M" in result:
+            duration = 1
+
+        # إذا كانت هناك إشارة فعلية ومدة واضحة،
+        # نحسب وقت دخول مستقبلي
+        if duration and ("CALL" in result or "PUT" in result):
+            from datetime import timedelta
+
+            # إعطاء وقت تجهيز قبل الدخول
+            entry_time = now + timedelta(minutes=1)
+
+            # تقريب وقت الدخول إلى بداية الدقيقة التالية
+            entry_time = entry_time.replace(second=0, microsecond=0)
+
+            entry_text = entry_time.strftime("%H:%M")
+
+            result += (
+                f"\n\n🕐 وقت الدخول المقترح: {entry_text}"
+                f"\n⏱️ مدة الصفقة: {duration}M"
+            )
 
         await msg.edit_text(result)
 
@@ -248,7 +279,7 @@ Do not give an old entry time from the screenshot.
         await msg.edit_text(
             "❌ تعذر تحليل الصورة الآن.\n"
             "تأكد من إعداد GEMINI_API_KEY وأن الصورة واضحة."
-        )
+    )."  )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
