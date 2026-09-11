@@ -281,7 +281,6 @@ Do not invent market data, candle times, or prices.
         )
 
 
-class HealthHandler(BaseHTTPRequestHandler):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
