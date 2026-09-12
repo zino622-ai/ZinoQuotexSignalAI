@@ -220,7 +220,13 @@ async def photo(
         # تشغيل Gemini خارج Event Loop
         # ----------------------------------------------------
 
-        def analyze_chart():
+         def analyze_chart():
+
+    last_error = None
+
+    for attempt in range(3):
+
+        try:
 
             return client.models.generate_content(
                 model="gemini-3.6-flash",
@@ -232,6 +238,28 @@ async def photo(
                     ANALYSIS_PROMPT,
                 ],
             )
+
+        except Exception as e:
+
+            last_error = e
+
+            error_text = str(e)
+
+            if "503" in error_text or "UNAVAILABLE" in error_text:
+
+                logging.warning(
+                    f"Gemini 503 - محاولة {attempt + 1}/3"
+                )
+
+                time.sleep(
+                    5 * (attempt + 1)
+                )
+
+                continue
+
+            raise
+
+    raise last_error
 
 
         try:
