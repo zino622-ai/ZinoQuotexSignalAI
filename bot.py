@@ -1,4 +1,5 @@
-import os
+import os 
+import asyncio
 import io
 import logging
 import threading
@@ -178,27 +179,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⚡ جاري تحليل الصورة بسرعة...")
-
-    try:
-        telegram_photo = update.message.photo[-1]
-
-        tg_file = await telegram_photo.get_file()
-        data = await tg_file.download_as_bytearray()
-
-        image = Image.open(io.BytesIO(data)).convert("RGB")
-
-        # تصغير الصورة لتقليل وقت الإرسال والتحليل
-        image.thumbnail((1400, 1400))
-
-        buffer = io.BytesIO()
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=80,
-            optimize=True
-        )
+ 
 
         image_bytes = buffer.getvalue()
 
@@ -250,15 +231,130 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 microsecond=0
             )
 
+ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    # 🔐 السماح لصاحب البوت فقط
+    owner_id = int(os.environ["OWNER_ID"])
+
+    if update.effective_user.id != owner_id:
+        await update.message.reply_text(
+            "🔒 هذا البوت خاص وغير متاح للاستخدام."
+        )
+        return
+
+    msg = await update.message.reply_text(
+        "⚡ جاري تحليل الصورة بسرعة..."
+    )
+
+    try:
+        telegram_photo = update.message.photo[-1]
+
+        tg_file = await telegram_photo.get_file()
+        data = await tg_file.download_as_bytearray()
+
+        image = Image.open(
+            io.BytesIO(data)
+        ).convert("RGB")
+
+        # نحافظ على جودة الصورة الحالية
+        image.thumbnail((1400, 1400))
+
+        buffer = io.BytesIO()
+
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=80,
+            optimize=True
+        )
+
+        image_bytes = buffer.getvalue()
+
+        # تحديث الرسالة قبل بدء Gemini
+        await msg.edit_text(
+            "🧠 جاري تحليل الشارت..."
+        )
+
+        # تشغيل Gemini خارج event loop
+        def analyze_chart():
+            return client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg"
+                    ),
+                    ANALYSIS_PROMPT,
+                ],
+            )
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(analyze_chart),
+                timeout=45
+            )
+
+        except asyncio.TimeoutError:
+
+            await msg.edit_text(
+                "⏳ التحليل استغرق وقتًا أطول من المتوقع.\n"
+                "📸 أرسل الصورة مرة أخرى."
+            )
+            return
+
+        result = response.text.strip()
+
+        if not result:
+            await msg.edit_text(
+                "❌ لم يتم الحصول على تحليل واضح.\n"
+                "📸 أرسل صورة أوضح للشارت."
+            )
+            return
+
+        # 🇩🇿 وقت الجزائر
+        now = datetime.now(
+            ZoneInfo("Africa/Algiers")
+        )
+
+        # استخراج مدة الصفقة
+        duration = None
+
+        if "⏱️ مدة الصفقة: 15M" in result:
+            duration = 15
+
+        elif "⏱️ مدة الصفقة: 5M" in result:
+            duration = 5
+
+        elif "⏱️ مدة الصفقة: 2M" in result:
+            duration = 2
+
+        elif "⏱️ مدة الصفقة: 1M" in result:
+            duration = 1
+
+        # إذا كانت CALL أو PUT
+        if duration and (
+            "🎯 الإشارة: CALL" in result
+            or "🎯 الإشارة: PUT" in result
+        ):
+
+            # وقت دخول مستقبلي
+            entry_time = now + timedelta(minutes=2)
+
+            entry_time = entry_time.replace(
+                second=0,
+                microsecond=0
+            )
+
             entry_text = entry_time.strftime("%H:%M")
 
-            # إذا كان Gemini قد وضع وقتًا سابقًا،
-            # نحذفه ونضع الوقت المستقبلي الذي حسبه البرنامج.
             lines = result.splitlines()
 
             cleaned_lines = [
-                line for line in lines
-                if not line.startswith("🕐 وقت الدخول:")
+                line
+                for line in lines
+                if not line.startswith(
+                    "🕐 وقت الدخول:"
+                )
             ]
 
             result = "\n".join(cleaned_lines)
@@ -269,13 +365,18 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         else:
-            # لا نعطي وقت دخول لإشارة غير صالحة
+
             lines = result.splitlines()
 
             cleaned_lines = [
-                line for line in lines
-                if not line.startswith("🕐 وقت الدخول:")
-                and not line.startswith("⏱️ مدة الصفقة:")
+                line
+                for line in lines
+                if not line.startswith(
+                    "🕐 وقت الدخول:"
+                )
+                and not line.startswith(
+                    "⏱️ مدة الصفقة:"
+                )
             ]
 
             result = "\n".join(cleaned_lines)
@@ -288,12 +389,18 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(result)
 
     except Exception:
-        logging.exception("Analysis failed")
 
-        await msg.edit_text(
-            "❌ تعذر تحليل الصورة الآن.\n"
-            "تأكد من أن الصورة واضحة وأن إعدادات Gemini صحيحة."
+        logging.exception(
+            "Analysis failed"
         )
+
+        try:
+            await msg.edit_text(
+                "❌ حدث خطأ أثناء تحليل الصورة.\n"
+                "📸 حاول إرسال الشارت مرة أخرى."
+            )
+        except Exception:
+            pass
 
 
 class HealthHandler(BaseHTTPRequestHandler):
