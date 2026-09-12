@@ -178,7 +178,156 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "يفضل أن يظهر اسم الأصل والإطار الزمني والشموع والمؤشرات."
     )
 
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
+    msg = await update.message.reply_text(
+        "⚡ جاري تحليل الصورة بسرعة..."
+    )
+
+    try:
+        telegram_photo = update.message.photo[-1]
+
+        tg_file = await telegram_photo.get_file()
+        data = await tg_file.download_as_bytearray()
+
+        image = Image.open(
+            io.BytesIO(data)
+        ).convert("RGB")
+
+        image.thumbnail((1400, 1400))
+
+        buffer = io.BytesIO()
+
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=80,
+            optimize=True
+        )
+
+        image_bytes = buffer.getvalue()
+
+        await msg.edit_text(
+            "🧠 جاري تحليل الشارت..."
+        )
+
+        def analyze_chart():
+            return client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg"
+                    ),
+                    ANALYSIS_PROMPT,
+                ],
+            )
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(analyze_chart),
+                timeout=45
+            )
+
+        except asyncio.TimeoutError:
+            await msg.edit_text(
+                "⏳ التحليل استغرق وقتًا أطول من المتوقع.\n"
+                "📸 أرسل الصورة مرة أخرى."
+            )
+            return
+
+        result = response.text.strip()
+
+        if not result:
+            await msg.edit_text(
+                "❌ لم يتم الحصول على تحليل واضح.\n"
+                "📸 أرسل صورة أوضح للشارت."
+            )
+            return
+
+        now = datetime.now(
+            ZoneInfo("Africa/Algiers")
+        )
+
+        duration = None
+
+        if "⏱️ مدة الصفقة: 15M" in result:
+            duration = 15
+        elif "⏱️ مدة الصفقة: 5M" in result:
+            duration = 5
+        elif "⏱️ مدة الصفقة: 2M" in result:
+            duration = 2
+        elif "⏱️ مدة الصفقة: 1M" in result:
+            duration = 1
+
+        if duration and (
+            "🎯 الإشارة: CALL" in result
+            or "🎯 الإشارة: PUT" in result
+        ):
+
+            entry_time = now + timedelta(minutes=2)
+
+            entry_time = entry_time.replace(
+                second=0,
+                microsecond=0
+            )
+
+            entry_text = entry_time.strftime("%H:%M")
+
+            lines = result.splitlines()
+
+            cleaned_lines = [
+                line
+                for line in lines
+                if not line.startswith(
+                    "🕐 وقت الدخول:"
+                )
+            ]
+
+            result = "\n".join(cleaned_lines)
+
+            result += (
+                f"\n🕐 وقت الدخول: {entry_text}"
+                f"\n⏱️ مدة الصفقة: {duration}M"
+            )
+
+        else:
+
+            lines = result.splitlines()
+
+            cleaned_lines = [
+                line
+                for line in lines
+                if not line.startswith(
+                    "🕐 وقت الدخول:"
+                )
+                and not line.startswith(
+                    "⏱️ مدة الصفقة:"
+                )
+            ]
+
+            result = "\n".join(cleaned_lines)
+
+            result += (
+                "\n🕐 وقت الدخول: لا يوجد"
+                "\n⏱️ مدة الصفقة: لا توجد"
+            )
+
+        await msg.edit_text(result)
+
+    except Exception:
+        logging.exception("Analysis failed")
+
+        try:
+            await msg.edit_text(
+                "❌ حدث خطأ أثناء تحليل الصورة.\n"
+                "📸 حاول إرسال الشارت مرة أخرى."
+            )
+        except Exception:
+            pass
+
+
+class HealthHandler(BaseHTTPRequestHandler):
  
 
         image_bytes = buffer.getvalue()
@@ -361,49 +510,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             result += (
                 f"\n🕐 وقت الدخول: {entry_text}"
-                f"\n⏱️ مدة الصفقة: {duration}M"
-            )
-
-        else:
-
-            lines = result.splitlines()
-
-            cleaned_lines = [
-                line
-                for line in lines
-                if not line.startswith(
-                    "🕐 وقت الدخول:"
-                )
-                and not line.startswith(
-                    "⏱️ مدة الصفقة:"
-                )
-            ]
-
-            result = "\n".join(cleaned_lines)
-
-            result += (
-                "\n🕐 وقت الدخول: لا يوجد"
-                "\n⏱️ مدة الصفقة: لا توجد"
-            )
-
-        await msg.edit_text(result)
-
-    except Exception:
-
-        logging.exception(
-            "Analysis failed"
-        )
-
-        try:
-            await msg.edit_text(
-                "❌ حدث خطأ أثناء تحليل الصورة.\n"
-                "📸 حاول إرسال الشارت مرة أخرى."
-            )
-        except Exception:
-            pass
-
-
-class HealthHandler(BaseHTTPRequestHandler):
+ 
 
     def do_GET(self):
         self.send_response(200)
