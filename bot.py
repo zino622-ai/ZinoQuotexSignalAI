@@ -93,30 +93,7 @@ ANALYSIS_PROMPT = """
 # ============================================================
 # /start
 # ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    owner_id = int(os.environ["OWNER_ID"])
-
-    if update.effective_user.id != owner_id:
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص وغير متاح للاستخدام."
-        )
-        return
-
-    await update.message.reply_text(
-        "👋 مرحبًا بك في ZinoQuotexSignalAI\n\n"
-        "📸 أرسل صورة واضحة للشارت.\n"
-        "🧠 سأقوم بتحليلها باستخدام Gemini.\n\n"
-        "يفضل أن يظهر في الصورة:\n"
-        "• اسم الأصل\n"
-        "• الإطار الزمني\n"
-        "• الشموع\n"
-        "• المؤشرات"
-    )
+ 
 
 
 # ============================================================
