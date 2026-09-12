@@ -60,9 +60,9 @@ ANALYSIS_PROMPT = """
 
 أعطني النتيجة بهذا الشكل بالضبط:
 
-🎯 الإشارة: CALL
+🎯 الإشارة: CALL🟢
 أو
-🎯 الإشارة: PUT
+🎯 الإشارة: PUT🔴
 أو
 🎯 الإشارة: NO SIGNAL
 
@@ -352,8 +352,7 @@ async def photo(
 
             result += (
                 f"\n🕐 وقت الدخول: {entry_text}"
-                f"\n⏱️ مدة الصفقة: {duration}M"
-            )
+                  ) 
 
 
         else:
