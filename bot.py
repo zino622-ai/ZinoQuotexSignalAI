@@ -918,7 +918,7 @@ async def photo(
 # MAIN
 # =========================================================
 
-def main():
+ def main():
 
     print(
         "🚀 Starting ZinoQuotexSignalAI..."
@@ -960,11 +960,12 @@ def main():
     )
 
     print(
-        "✅ ZinoQuotexSignalAI is ready."
+        "🧹 Cleaning old Telegram webhook..."
     )
 
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
