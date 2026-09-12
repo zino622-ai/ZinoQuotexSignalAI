@@ -5,11 +5,9 @@ import re
 import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
-
 from PIL import Image
 from google import genai
 from google.genai import types
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,7 +31,9 @@ GEMINI_MODEL = os.environ.get(
     "gemini-2.5-flash"
 )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # ============================================================
