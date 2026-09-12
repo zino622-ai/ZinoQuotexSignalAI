@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import asyncio
 import logging
 import threading
@@ -29,8 +30,8 @@ from google.genai import types
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-
 OWNER_ID = int(os.environ["OWNER_ID"])
+
 
 client = genai.Client(
     api_key=GEMINI_API_KEY
@@ -93,7 +94,25 @@ ANALYSIS_PROMPT = """
 # ============================================================
 # /start
 # ============================================================
- 
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    owner_id = int(os.environ["OWNER_ID"])
+
+    if update.effective_user.id != owner_id:
+        await update.message.reply_text(
+            "🔒 هذا البوت خاص وغير متاح للاستخدام."
+        )
+        return
+
+    await update.message.reply_text(
+        "👋 مرحبًا بك في ZinoQuotexSignalAI\n\n"
+        "📸 أرسل صورة واضحة للشارت "
+        "وسأقوم بتحليلها."
+    )
 
 
 # ============================================================
@@ -115,7 +134,8 @@ async def help_cmd(
 
     await update.message.reply_text(
         "📸 أرسل صورة واضحة للرسم البياني.\n"
-        "يفضل أن يظهر اسم الأصل والإطار الزمني والشموع والمؤشرات."
+        "يفضل أن يظهر اسم الأصل والإطار الزمني "
+        "والشموع والمؤشرات."
     )
 
 
@@ -128,7 +148,10 @@ async def photo(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    # 🔐 السماح لصاحب البوت فقط
+    # --------------------------------------------------------
+    # السماح لصاحب البوت فقط
+    # --------------------------------------------------------
+
     owner_id = int(os.environ["OWNER_ID"])
 
     if update.effective_user.id != owner_id:
@@ -137,9 +160,11 @@ async def photo(
         )
         return
 
+
     msg = await update.message.reply_text(
         "⚡ جاري تحليل الصورة بسرعة..."
     )
+
 
     try:
 
@@ -194,50 +219,58 @@ async def photo(
 
 
         # ----------------------------------------------------
-        # تشغيل Gemini خارج Event Loop
+        # تحليل Gemini خارج Event Loop
         # ----------------------------------------------------
 
-         def analyze_chart():
+        def analyze_chart():
 
-    last_error = None
+            last_error = None
 
-    for attempt in range(3):
+            for attempt in range(3):
 
-        try:
+                try:
 
-            return client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=[
-                    types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type="image/jpeg"
-                    ),
-                    ANALYSIS_PROMPT,
-                ],
-            )
+                    return client.models.generate_content(
+                        model="gemini-3.6-flash",
+                        contents=[
+                            types.Part.from_bytes(
+                                data=image_bytes,
+                                mime_type="image/jpeg"
+                            ),
+                            ANALYSIS_PROMPT,
+                        ],
+                    )
 
-        except Exception as e:
+                except Exception as e:
 
-            last_error = e
+                    last_error = e
 
-            error_text = str(e)
+                    error_text = str(e)
 
-            if "503" in error_text or "UNAVAILABLE" in error_text:
+                    if (
+                        "503" in error_text
+                        or "UNAVAILABLE" in error_text
+                    ):
 
-                logging.warning(
-                    f"Gemini 503 - محاولة {attempt + 1}/3"
-                )
+                        logging.warning(
+                            f"Gemini 503 - محاولة "
+                            f"{attempt + 1}/3"
+                        )
 
-                time.sleep(
-                    5 * (attempt + 1)
-                )
+                        time.sleep(
+                            5 * (attempt + 1)
+                        )
 
-                continue
+                        continue
 
-            raise
+                    raise
 
-    raise last_error
+            raise last_error
 
+
+        # ----------------------------------------------------
+        # تشغيل التحليل مع Timeout
+        # ----------------------------------------------------
 
         try:
 
@@ -316,16 +349,24 @@ async def photo(
             or "🎯 الإشارة: PUT" in result
         ):
 
+            # ------------------------------------------------
             # وقت دخول مستقبلي
+            # ------------------------------------------------
+
             entry_time = now + timedelta(
                 minutes=2
             )
 
+
+            # ------------------------------------------------
             # تقريب إلى بداية الدقيقة
+            # ------------------------------------------------
+
             entry_time = entry_time.replace(
                 second=0,
                 microsecond=0
             )
+
 
             entry_text = entry_time.strftime(
                 "%H:%M"
@@ -333,7 +374,7 @@ async def photo(
 
 
             # ------------------------------------------------
-            # إزالة وقت الدخول القديم إن وجِد
+            # إزالة وقت الدخول القديم إن وجد
             # ------------------------------------------------
 
             lines = result.splitlines()
@@ -357,7 +398,7 @@ async def photo(
 
             result += (
                 f"\n🕐 وقت الدخول: {entry_text}"
-                  ) 
+            )
 
 
         else:
@@ -382,6 +423,7 @@ async def photo(
             result = "\n".join(
                 cleaned_lines
             )
+
 
             result += (
                 "\n🕐 وقت الدخول: لا يوجد"
@@ -434,6 +476,11 @@ class HealthHandler(
             200
         )
 
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+
         self.end_headers()
 
         self.wfile.write(
@@ -463,6 +510,7 @@ def start_web_server():
         )
     )
 
+
     server = HTTPServer(
         (
             "0.0.0.0",
@@ -471,9 +519,11 @@ def start_web_server():
         HealthHandler
     )
 
+
     logging.info(
         f"Web server running on port {port}"
     )
+
 
     server.serve_forever()
 
@@ -521,6 +571,7 @@ def main():
         )
     )
 
+
     app.add_handler(
         CommandHandler(
             "help",
@@ -548,6 +599,7 @@ def main():
     logging.info(
         "Telegram bot starting..."
     )
+
 
     app.run_polling()
 
