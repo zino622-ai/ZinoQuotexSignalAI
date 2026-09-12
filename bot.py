@@ -9,12 +9,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+from telegram.ext import (Application,CommandHandler,MessageHandler,ContextTypes,filters,
 )
 
 
