@@ -918,7 +918,7 @@ async def photo(
 # MAIN
 # =========================================================
 
- def main():
+def main():
 
     print(
         "🚀 Starting ZinoQuotexSignalAI..."
