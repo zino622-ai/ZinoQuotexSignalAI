@@ -317,15 +317,12 @@ def main():
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
-    )
-
-
-# =========================================================
+    )# =========================================================
 # RUN
 # =========================================================
 
 if __name__ == "__main__":
- main()ers"))
+    main()
 
         # استخراج مدة الصفقة التي اختارها Gemini
         duration = None
