@@ -5,10 +5,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from PIL import Image
 from google import genai
 from google.genai import types
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -34,14 +39,45 @@ client = genai.Client(
 
 
 # =========================================================
+# SESSION STATISTICS
+# =========================================================
+
+wins = 0
+losses = 0
+
+
+def get_stats_text():
+
+    total = wins + losses
+
+    if total > 0:
+        win_rate = (wins / total) * 100
+        loss_rate = (losses / total) * 100
+    else:
+        win_rate = 0
+        loss_rate = 0
+
+    return (
+        "📊 إحصائيات الجلسة\n\n"
+        f"📈 إجمالي الصفقات: {total}\n"
+        f"🟢 WIN: {wins}\n"
+        f"🔴 LOSS: {losses}\n\n"
+        f"🎯 نسبة النجاح: {win_rate:.1f}%\n"
+        f"📉 نسبة الخسارة: {loss_rate:.1f}%"
+    )
+
+
+# =========================================================
 # RENDER HEALTH SERVER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
         self.end_headers()
+
         self.wfile.write(
             b"ZinoQuotexSignalAI is running."
         )
@@ -72,6 +108,20 @@ def start_health_server():
 
 
 # =========================================================
+# OWNER CHECK
+# =========================================================
+
+def is_owner(update: Update):
+
+    user = update.effective_user
+
+    return (
+        user is not None
+        and user.id == OWNER_ID
+    )
+
+
+# =========================================================
 # /START
 # =========================================================
 
@@ -80,7 +130,7 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if not is_owner(update):
 
         await update.message.reply_text(
             "🔒 هذا البوت خاص وغير متاح للاستخدام."
@@ -91,7 +141,11 @@ async def start(
     await update.message.reply_text(
         "👋 مرحبًا بك في ZinoQuotexSignalAI\n\n"
         "📸 أرسل صورة واضحة لشارت Quotex.\n"
-        "وسأحلل الاتجاه وأعطيك إشارة CALL أو PUT."
+        "وسأحلل الاتجاه وأعطيك إشارة CALL أو PUT.\n\n"
+        "📊 لمعرفة إحصائيات الصفقات:\n"
+        "/stats\n\n"
+        "🔄 لتصفير الإحصائيات:\n"
+        "/reset"
     )
 
 
@@ -104,7 +158,7 @@ async def help_cmd(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if not is_owner(update):
 
         await update.message.reply_text(
             "🔒 هذا البوت خاص."
@@ -118,7 +172,135 @@ async def help_cmd(
         "• اسم الأصل\n"
         "• الإطار الزمني\n"
         "• الشموع\n"
-        "• أكبر قدر ممكن من حركة السعر"
+        "• أكبر قدر ممكن من حركة السعر\n\n"
+        "📊 /stats — إحصائيات الجلسة\n"
+        "🔄 /reset — تصفير الإحصائيات"
+    )
+
+
+# =========================================================
+# /STATS
+# =========================================================
+
+async def stats_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_owner(update):
+
+        await update.message.reply_text(
+            "🔒 هذا البوت خاص."
+        )
+
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔄 تصفير الإحصائيات",
+                callback_data="reset_stats"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        get_stats_text(),
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# /RESET
+# =========================================================
+
+async def reset_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global wins, losses
+
+    if not is_owner(update):
+
+        await update.message.reply_text(
+            "🔒 هذا البوت خاص."
+        )
+
+        return
+
+    wins = 0
+    losses = 0
+
+    await update.message.reply_text(
+        "🔄 تم تصفير إحصائيات الجلسة.\n\n"
+        "📈 إجمالي الصفقات: 0\n"
+        "🟢 WIN: 0\n"
+        "🔴 LOSS: 0"
+    )
+
+
+# =========================================================
+# WIN / LOSS BUTTONS
+# =========================================================
+
+async def result_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global wins, losses
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.from_user.id != OWNER_ID:
+
+        await query.answer(
+            "🔒 غير مسموح.",
+            show_alert=True
+        )
+
+        return
+
+    data = query.data
+
+    if data == "win":
+
+        wins += 1
+        result_text = "🟢 تم تسجيل الصفقة: WIN"
+
+    elif data == "loss":
+
+        losses += 1
+        result_text = "🔴 تم تسجيل الصفقة: LOSS"
+
+    elif data == "reset_stats":
+
+        wins = 0
+        losses = 0
+
+        await query.edit_message_text(
+            "🔄 تم تصفير إحصائيات الجلسة.\n\n"
+            "📈 إجمالي الصفقات: 0\n"
+            "🟢 WIN: 0\n"
+            "🔴 LOSS: 0"
+        )
+
+        return
+
+    else:
+        return
+
+    # إزالة أزرار WIN / LOSS بعد تسجيل النتيجة
+    await query.edit_message_reply_markup(
+        reply_markup=None
+    )
+
+    await query.message.reply_text(
+        f"{result_text}\n\n"
+        f"{get_stats_text()}"
     )
 
 
@@ -131,7 +313,7 @@ async def photo(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if not is_owner(update):
 
         await update.message.reply_text(
             "🔒 هذا البوت خاص وغير متاح للاستخدام."
@@ -139,7 +321,7 @@ async def photo(
 
         return
 
-    await update.message.reply_text(
+    status_message = await update.message.reply_text(
         "🔍 جاري تحليل الشارت..."
     )
 
@@ -250,8 +432,24 @@ Structure + Liquidity + Momentum + Confirmation Candle.
 
         result = response.text
 
-        await update.message.reply_text(
-            result
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🟢 WIN",
+                    callback_data="win"
+                ),
+                InlineKeyboardButton(
+                    "🔴 LOSS",
+                    callback_data="loss"
+                )
+            ]
+        ]
+
+        await status_message.edit_text(
+            result,
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
         )
 
     except Exception as e:
@@ -260,7 +458,7 @@ Structure + Liquidity + Momentum + Confirmation Candle.
             f"BOT ERROR: {repr(e)}"
         )
 
-        await update.message.reply_text(
+        await status_message.edit_text(
             "❌ حدث خطأ أثناء تحليل الصورة.\n"
             "حاول إرسال الشارت مرة أخرى."
         )
@@ -304,6 +502,27 @@ def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_cmd
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reset",
+            reset_cmd
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            result_callback,
+            pattern="^(win|loss|reset_stats)$"
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.PHOTO,
             photo
@@ -317,149 +536,12 @@ def main():
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
-    )# =========================================================
+    )
+
+
+# =========================================================
 # RUN
 # =========================================================
-
-if __name__ == "__main__":
-    main()
-
-        # استخراج مدة الصفقة التي اختارها Gemini
-        duration = None
-
-        if "⏱️ مدة الصفقة: 15M" in result:
-            duration = 15
-        elif "⏱️ مدة الصفقة: 5M" in result:
-            duration = 5
-        elif "⏱️ مدة الصفقة: 2M" in result:
-            duration = 2
-        elif "⏱️ مدة الصفقة: 1M" in result:
-            duration = 1
-
-        # إذا كانت الإشارة CALL أو PUT ووجدت مدة
-        if duration and (
-            "🎯 الإشارة: CALL" in result
-            or "🎯 الإشارة: PUT" in result
-        ):
-            # نعطي وقت تجهيز قبل الدخول
-            entry_time = now + timedelta(minutes=2)
-
-            # تقريب إلى بداية الدقيقة
-            entry_time = entry_time.replace(
-                second=0,
-                microsecond=0
-            )
-
-            entry_text = entry_time.strftime("%H:%M")
-
-            # إذا كان Gemini قد وضع وقتًا سابقًا،
-            # نحذفه ونضع الوقت المستقبلي الذي حسبه البرنامج.
-            lines = result.splitlines()
-
-            cleaned_lines = [
-                line for line in lines
-                if not line.startswith("🕐 وقت الدخول:")
-            ]
-
-            result = "\n".join(cleaned_lines)
-
-            result += (
-                f"\n🕐 وقت الدخول: {entry_text}"
-                f"\n⏱️ مدة الصفقة: {duration}M"
-            )
-
-        else:
-            # لا نعطي وقت دخول لإشارة غير صالحة
-            lines = result.splitlines()
-
-            cleaned_lines = [
-                line for line in lines
-                if not line.startswith("🕐 وقت الدخول:")
-                and not line.startswith("⏱️ مدة الصفقة:")
-            ]
-
-            result = "\n".join(cleaned_lines)
-
-            result += (
-                "\n🕐 وقت الدخول: لا يوجد"
-                "\n⏱️ مدة الصفقة: لا توجد"
-            )
-
-        await msg.edit_text(result)
-
-    except Exception:
-        logging.exception("Analysis failed")
-
-        await msg.edit_text(
-            "❌ تعذر تحليل الصورة الآن.\n"
-            "تأكد من أن الصورة واضحة وأن إعدادات Gemini صحيحة."
-        )
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(
-            b"ZinoQuotexSignalAI is running"
-        )
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_web_server():
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
-    logging.info(
-        f"Web server running on port {port}"
-    )
-
-    server.serve_forever()
-
-
-def main():
-
-    web_thread = threading.Thread(
-        target=start_web_server,
-        daemon=True
-    )
-
-    web_thread.start()
-
-    app = Application.builder().token(
-        TELEGRAM_TOKEN
-    ).build()
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_cmd)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo
-        )
-    )
-
-    logging.info(
-        "Telegram bot starting..."
-    )
-
-    app.run_polling()
-
 
 if __name__ == "__main__":
     main()
