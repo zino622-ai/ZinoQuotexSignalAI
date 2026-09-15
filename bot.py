@@ -1,22 +1,14 @@
 import os
 import io
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
+
 from PIL import Image
 from google import genai
-from google.genai import types
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -33,278 +25,303 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
-    "gemini-3.6-flash"
+    "gemini-2.5-flash"
 )
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # =========================================================
-# SESSION STATISTICS
-# =========================================================
-
-wins = 0
-losses = 0
-
-
-def get_stats_text():
-
-    total = wins + losses
-
-    if total > 0:
-        win_rate = (wins / total) * 100
-        loss_rate = (losses / total) * 100
-    else:
-        win_rate = 0
-        loss_rate = 0
-
-    return (
-        "📊 إحصائيات الجلسة\n\n"
-        f"📈 إجمالي الصفقات: {total}\n"
-        f"🟢 WIN: {wins}\n"
-        f"🔴 LOSS: {losses}\n\n"
-        f"🎯 نسبة النجاح: {win_rate:.1f}%\n"
-        f"📉 نسبة الخسارة: {loss_rate:.1f}%"
-    )
-
-
-# =========================================================
-# RENDER HEALTH SERVER
+# HEALTH SERVER FOR RENDER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
-
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
-
-        self.wfile.write(
-            b"ZinoQuotexSignalAI is running."
-        )
+        self.wfile.write(b"ZinoQuotexSignalAI is running")
 
     def log_message(self, format, *args):
         return
 
 
 def start_health_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
-    print(
-        f"🌐 Health server running on port {port}"
-    )
-
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
 
-# =========================================================
-# OWNER CHECK
-# =========================================================
-
-def is_owner(update: Update):
-
-    user = update.effective_user
-
-    return (
-        user is not None
-        and user.id == OWNER_ID
-    )
+Thread(target=start_health_server, daemon=True).start()
 
 
 # =========================================================
-# /START
+# ANALYSIS PROMPT
 # =========================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+ANALYSIS_PROMPT = """
+أنت محلل فني متخصص في تحليل شارتات Quotex OTC على إطار M1 (1 دقيقة).
 
-    if not is_owner(update):
+مهمتك تحليل صورة الشارت المرسلة فقط، ثم إعطاء إشارة تداول واحدة واضحة:
 
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص وغير متاح للاستخدام."
-        )
+CALL (UP)
+أو
+PUT (DOWN)
 
+استخدم منهجية:
+
+Market Structure + Liquidity + Momentum + Price Action + Confirmation Candle
+
+لا تعتمد على مؤشر واحد فقط، ولا تخترع بيانات أو مستويات سعرية غير ظاهرة بوضوح في الشارت.
+
+========================
+قواعد التحليل
+========================
+
+1. Market Structure
+
+حدد الهيكل العام للسوق:
+
+Higher Highs + Higher Lows = Bullish
+
+Lower Highs + Lower Lows = Bearish
+
+إذا كان الهيكل مختلطًا، حدد الاتجاه الأقوى والأحدث.
+
+2. Momentum
+
+حلل قوة الحركة الأخيرة:
+
+- قوة الشموع
+- سرعة الحركة
+- تسلسل الشموع
+- هل الزخم مستمر؟
+- هل الزخم بدأ يضعف؟
+- هل توجد علامات Exhaustion؟
+
+3. Liquidity
+
+ابحث عن:
+
+- Liquidity Sweep
+- سحب سيولة القمم
+- سحب سيولة القيعان
+- Fake Breakout
+- Stop Hunt
+
+إذا لم يكن Liquidity Sweep واضحًا، لا تدّعي حدوثه.
+
+4. Price Action
+
+حلل:
+
+- Rejection
+- Breakout
+- Pullback
+- Engulfing
+- Pin Bar / Hammer
+- Shooting Star
+- Marubozu
+- Continuation
+- Reversal
+
+ركز خصوصًا على آخر الشموع.
+
+5. Confirmation Candle
+
+حدد آخر شمعة أو مجموعة شموع تؤكد الإشارة.
+
+اشرح لماذا تعتبر تأكيدًا.
+
+6. القرار النهائي
+
+اختر CALL أو PUT بناءً على مجموع الأدلة.
+
+يمكن أن يكون الاتجاه العام Bearish ولكن الإشارة CALL إذا ظهرت أدلة قوية على ارتداد صاعد قصير المدى، مثل:
+
+Liquidity Sweep للقيعان
++
+Rejection قوي
++
+Bullish Pinbar / Hammer
++
+تحسن Momentum
+
+وبالعكس:
+
+يمكن أن يكون الاتجاه العام Bullish ولكن الإشارة PUT إذا ظهرت أدلة قوية على انعكاس هابط قصير المدى.
+
+لا تجعل الاتجاه العام وحده يحدد الإشارة.
+
+========================
+قاعدة مهمة جدًا
+========================
+
+يجب أن تكون الإشارة متوافقة مع أقوى دليل موجود في آخر جزء من الشارت.
+
+إذا كان الاتجاه العام هابطًا ولكن توجد إشارة ارتداد صاعد واضحة في آخر الشموع، يمكن إعطاء CALL.
+
+إذا كان الاتجاه العام صاعدًا ولكن توجد إشارة انعكاس هابط واضحة في آخر الشموع، يمكن إعطاء PUT.
+
+لا تعطِ CALL و PUT معًا.
+
+ممنوع استخدام:
+
+NO SIGNAL
+NEUTRAL
+WAIT
+HOLD
+
+يجب دائمًا اختيار:
+
+CALL (UP)
+
+أو
+
+PUT (DOWN)
+
+لكن لا تعطِ ثقة عالية بدون أدلة كافية.
+
+========================
+الثقة
+========================
+
+أعطِ نسبة ثقة من 55% إلى 85%.
+
+الثقة ليست ضمانًا للربح.
+
+ارفع الثقة عندما تتفق عدة عوامل:
+
+Structure
++
+Liquidity
++
+Momentum
++
+Price Action
++
+Confirmation
+
+اخفض الثقة عندما تكون الأدلة متناقضة.
+
+لا تجعل نسبة الثقة عشوائية.
+
+========================
+استخراج البيانات
+========================
+
+حاول قراءة:
+
+- اسم الأصل
+- OTC
+- الإطار الزمني
+
+إذا لم تكن البيانات واضحة، اكتب:
+
+غير واضح
+
+ولا تخترع اسم الأصل أو الإطار الزمني.
+
+لا تخترع مستويات سعرية.
+
+لا تذكر رقم سعر إلا إذا كان ظاهرًا بوضوح في الشارت.
+
+========================
+صيغة الإجابة
+========================
+
+ابدأ مباشرة بهذا الشكل:
+
+🎯 الإشارة: [🟢 CALL (UP) أو 🔴 PUT (DOWN)] [النسبة]%
+
+📊 نسبة الثقة: [النسبة]%
+📊 الأصل: [اسم الأصل]
+📊 الإطار الزمني: [1 دقيقة (1M) أو ما يظهر في الشارت]
+🧭 الاتجاه: [Bullish / Bearish]
+📈 الاتجاه القصير: [Bullish / Bearish + وصف مختصر إذا لزم]
+
+📐 Market Structure
+اشرح هيكل السوق باختصار، مع ذكر Higher Highs/Higher Lows أو Lower Highs/Lower Lows إذا كانت واضحة.
+
+⚡ Momentum
+اشرح قوة الزخم الحالي وهل هو مستمر أو ضعيف أو يظهر عليه Exhaustion.
+
+💧 Liquidity
+اشرح وجود Liquidity Sweep أو Stop Hunt فقط إذا كان ظاهرًا بوضوح.
+
+اذكر هل تم سحب Buy-side أو Sell-side Liquidity.
+
+📊 Price Action
+اشرح أهم حركة سعرية في آخر الشموع، مثل Rejection أو Breakout أو Pullback أو Engulfing.
+
+🕯️ شمعة التأكيد
+حدد نوع شمعة التأكيد إذا كان واضحًا، واشرح لماذا تدعم CALL أو PUT.
+
+📈 السبب
+اكتب خلاصة قوية ومباشرة تجمع أهم الأدلة التي أدت إلى الإشارة.
+
+========================
+الأسلوب
+========================
+
+اكتب بالعربية الواضحة مع المصطلحات الإنجليزية بين قوسين.
+
+كن مختصرًا لكن تحليلك يجب أن يكون مفيدًا ومحددًا.
+
+لا تكرر نفس الفكرة في أكثر من قسم.
+
+لا تذكر Support/Resistance كقسم مستقل.
+
+لا تستخدم RSI أو MACD أو Moving Average إلا إذا كانت ظاهرة فعلًا في الصورة.
+
+لا تفترض وجود مؤشرات غير ظاهرة.
+
+لا تخترع معلومات غير موجودة في الشارت.
+
+وفي النهاية أضف:
+
+---
+*تنويه: التداول ينطوي على مخاطر عالية، وهذه القراءة مبنية على التحليل الفني للشارت المرفق فقط ولا تعتبر ضمانًا للربح.*
+"""
+
+
+# =========================================================
+# START COMMAND
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا البوت خاص.")
         return
 
     await update.message.reply_text(
-        "👋 مرحبًا بك في ZinoQuotexSignalAI\n\n"
-        "📸 أرسل صورة واضحة لشارت Quotex.\n"
-        "وسأحلل الاتجاه وأعطيك إشارة CALL أو PUT.\n\n"
-        "📊 لمعرفة إحصائيات الصفقات:\n"
-        "/stats\n\n"
-        "🔄 لتصفير الإحصائيات:\n"
-        "/reset"
+        "🤖 ZinoQuotexSignalAI جاهز.\n\n"
+        "📸 أرسل صورة الشارت وسأحللها."
     )
 
 
 # =========================================================
-# /HELP
+# HELP COMMAND
 # =========================================================
 
-async def help_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص."
-        )
-
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا البوت خاص.")
         return
 
     await update.message.reply_text(
-        "📸 أرسل صورة واضحة للرسم البياني.\n\n"
-        "يفضل أن يظهر:\n"
-        "• اسم الأصل\n"
-        "• الإطار الزمني\n"
-        "• الشموع\n"
-        "• المؤشرات إن وجدت\n"
-        "• Volume إن كان ظاهرًا\n"
-        "• أكبر قدر ممكن من حركة السعر\n\n"
-        "📊 /stats — إحصائيات الجلسة\n"
-        "🔄 /reset — تصفير الإحصائيات"
-    )
-
-
-# =========================================================
-# /STATS
-# =========================================================
-
-async def stats_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص."
-        )
-
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🔄 تصفير الإحصائيات",
-                callback_data="reset_stats"
-            )
-        ]
-    ]
-
-    await update.message.reply_text(
-        get_stats_text(),
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# =========================================================
-# /RESET
-# =========================================================
-
-async def reset_cmd(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global wins, losses
-
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص."
-        )
-
-        return
-
-    wins = 0
-    losses = 0
-
-    await update.message.reply_text(
-        "🔄 تم تصفير إحصائيات الجلسة.\n\n"
-        "📈 إجمالي الصفقات: 0\n"
-        "🟢 WIN: 0\n"
-        "🔴 LOSS: 0"
-    )
-
-
-# =========================================================
-# WIN / LOSS BUTTONS
-# =========================================================
-
-async def result_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global wins, losses
-
-    query = update.callback_query
-
-    if query.from_user.id != OWNER_ID:
-
-        await query.answer(
-            "🔒 غير مسموح.",
-            show_alert=True
-        )
-
-        return
-
-    await query.answer()
-
-    data = query.data
-
-    if data == "win":
-
-        wins += 1
-        result_text = "🟢 تم تسجيل الصفقة: WIN"
-
-    elif data == "loss":
-
-        losses += 1
-        result_text = "🔴 تم تسجيل الصفقة: LOSS"
-
-    elif data == "reset_stats":
-
-        wins = 0
-        losses = 0
-
-        await query.edit_message_text(
-            "🔄 تم تصفير إحصائيات الجلسة.\n\n"
-            "📈 إجمالي الصفقات: 0\n"
-            "🟢 WIN: 0\n"
-            "🔴 LOSS: 0"
-        )
-
-        return
-
-    else:
-        return
-
-    await query.edit_message_reply_markup(
-        reply_markup=None
-    )
-
-    await query.message.reply_text(
-        f"{result_text}\n\n"
-        f"{get_stats_text()}"
+        "📸 أرسل Screenshot للشارت.\n\n"
+        "سأعطيك:\n"
+        "🎯 CALL أو PUT\n"
+        "📊 نسبة الثقة\n"
+        "🧭 الاتجاه العام\n"
+        "📈 الاتجاه القصير\n"
+        "📐 Market Structure\n"
+        "⚡ Momentum\n"
+        "💧 Liquidity\n"
+        "📊 Price Action\n"
+        "🕯️ Confirmation Candle\n"
+        "📈 السبب"
     )
 
 
@@ -312,469 +329,51 @@ async def result_callback(
 # PHOTO ANALYSIS
 # =========================================================
 
-async def photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not is_owner(update):
-
-        await update.message.reply_text(
-            "🔒 هذا البوت خاص وغير متاح للاستخدام."
-        )
-
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ هذا البوت خاص.")
         return
 
-    status_message = await update.message.reply_text(
-        "🔍 جاري تحليل الشارت..."
-    )
-
     try:
-
-        photo_file = await update.message.photo[-1].get_file()
-
-        image_bytes = await photo_file.download_as_bytearray()
-
-        image = Image.open(
-            io.BytesIO(image_bytes)
+        await update.message.reply_text(
+            "🔍 جاري تحليل الشارت..."
         )
 
-        image.thumbnail(
-            (1400, 1400)
-        )
+        photo = update.message.photo[-1]
 
-        buffer = io.BytesIO()
+        file = await context.bot.get_file(photo.file_id)
 
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=90
-        )
+        image_bytes = await file.download_as_bytearray()
 
-        image_data = buffer.getvalue()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        # =================================================
-        # CURRENT ALGERIA TIME
-        # =================================================
+        # تصغير الصورة إذا كانت كبيرة
+        image.thumbnail((1400, 1400))
 
-        algeria_now = datetime.now(
-            ZoneInfo("Africa/Algiers")
-        )
-
-        current_time = algeria_now.strftime(
-            "%H:%M"
-        )
-
-        current_date = algeria_now.strftime(
-            "%Y-%m-%d"
-        )
-
-        # =================================================
-        # FINAL ANALYSIS PROMPT
-        # =================================================
-
-        prompt = f"""
-أنت محلل تقني محترف متخصص في تحليل صور شارتات التداول.
-
-حلل صورة الشارت المرفقة فقط.
-لا تخترع أي بيانات أو مؤشرات أو Volume أو معلومات غير ظاهرة بوضوح في الصورة.
-
-هدفك هو تحديد السيناريو الأقوى لحركة السعر القادمة، وليس مجرد وصف ما حدث.
-
-━━━━━━━━━━━━━━━━━━
-📊 1. تحديد الشارت
-━━━━━━━━━━━━━━━━━━
-
-حدد إذا كان ظاهرًا:
-- اسم الأصل.
-- الإطار الزمني Timeframe.
-- السعر الحالي.
-- المؤشرات الموجودة.
-- Volume.
-
-لا تفترض أي معلومة غير ظاهرة.
-
-━━━━━━━━━━━━━━━━━━
-🏗️ 2. Market Structure
-━━━━━━━━━━━━━━━━━━
-
-حلل:
-
-- Higher High / Higher Low.
-- Lower High / Lower Low.
-- Break of Structure.
-- CHoCH / Market Structure Shift إذا كان واضحًا.
-- قوة الاتجاه الرئيسي.
-- هل الاتجاه مستمر أم بدأ يفقد قوته؟
-
-راقب خصوصًا فشل السعر في تكوين قمة أو قاع جديد كما كان يفعل سابقًا.
-
-━━━━━━━━━━━━━━━━━━
-💧 3. Liquidity
-━━━━━━━━━━━━━━━━━━
-
-ابحث عن:
-
-- Liquidity Sweep.
-- Stop Hunt.
-- Fake Breakout.
-- رفض السعر بعد أخذ السيولة.
-- انتقال محتمل للسيولة بين المشترين والبائعين.
-
-لا تعتبر أي Wick عشوائي Liquidity Sweep إلا إذا كان سلوك السعر يدعمه.
-
-━━━━━━━━━━━━━━━━━━
-⚡ 4. Momentum
-━━━━━━━━━━━━━━━━━━
-
-قيّم:
-
-- قوة الحركة الحالية.
-- تسارع أو تباطؤ السعر.
-- سيطرة المشترين أو البائعين.
-- علامات Exhaustion.
-- هل Momentum يؤكد الاتجاه أم يتعارض معه؟
-
-━━━━━━━━━━━━━━━━━━
-🕯️ 5. Candle Psychology
-━━━━━━━━━━━━━━━━━━
-
-لا تنظر إلى لون الشمعة فقط.
-
-حلل:
-
-- حجم الجسم.
-- طول الـWick.
-- مكان الإغلاق.
-- العلاقة مع الشموع السابقة.
-- سرعة الحركة.
-- الرفض السعري.
-- ضغط المشترين والبائعين.
-- التردد.
-- Engulfing.
-- Pin Bar / Rejection.
-- الشموع القوية بعد Liquidity Sweep.
-
-حاول فهم سيكولوجية السوق:
-
-هل المشترون يسيطرون؟
-هل البائعون يسيطرون؟
-هل أحد الطرفين يفقد السيطرة؟
-هل يوجد رفض قوي؟
-هل توجد علامات Trap؟
-هل الحركة استمرار أم بداية انعكاس؟
-
-لا تعتمد على شمعة واحدة فقط.
-
-━━━━━━━━━━━━━━━━━━
-🔄 6. التحول المبكر في سلوك السعر
-━━━━━━━━━━━━━━━━━━
-
-ابحث عن علامات مبكرة على تغير سلوك السوق:
-
-- ضعف الاتجاه الحالي.
-- فشل في تكوين قمة أعلى أو قاع أدنى.
-- تغير تسلسل القمم والقيعان.
-- Liquidity Sweep ثم رفض قوي.
-- CHoCH أو Market Structure Shift.
-- تغير Momentum قبل تغير الاتجاه.
-- شموع قوية عكس الاتجاه بعد ظهور الضعف.
-- فشل متكرر في مواصلة الاتجاه.
-- انتقال السيطرة من المشترين للبائعين أو العكس.
-
-لا تعتبر علامة واحدة كافية.
-
-يصبح احتمال التحول أقوى عندما تتوافق عدة علامات معًا.
-
-لا تفترض انعكاسًا مؤكدًا بدون Confirmation.
-
-━━━━━━━━━━━━━━━━━━
-📊 7. Technical Indicators
-━━━━━━━━━━━━━━━━━━
-
-إذا كانت المؤشرات ظاهرة بوضوح، استخدمها كأدلة مساعدة.
-
-افحص المؤشرات الظاهرة مثل:
-
-- Moving Averages.
-- RSI.
-- MACD.
-- Stochastic.
-- Bollinger Bands.
-- أو أي مؤشر آخر ظاهر.
-
-ابحث عن:
-
-- توافق المؤشرات مع الاتجاه.
-- Divergence.
-- Crossovers.
-- Overbought / Oversold.
-- تغير Momentum.
-
-لا تعتمد على مؤشر واحد.
-
-إذا تعارض المؤشر مع Price Action وMarket Structure،
-أعطِ الأولوية لسلوك السعر.
-
-لا تخترع أي مؤشر غير ظاهر.
-
-━━━━━━━━━━━━━━━━━━
-📐 8. Chart Patterns
-━━━━━━━━━━━━━━━━━━
-
-ابحث عن الأنماط الواضحة فقط:
-
-- Double Top / Double Bottom.
-- Head and Shoulders.
-- Triangles.
-- Flags / Pennants.
-- Wedges.
-- Breakout / Retest.
-- Range.
-- Reversal Patterns.
-- Continuation Patterns.
-
-لا تفترض وجود Pattern بسبب تشابه بسيط.
-
-يجب أن يكون النمط واضحًا ومدعومًا بحركة السعر.
-
-━━━━━━━━━━━━━━━━━━
-📦 9. Volume
-━━━━━━━━━━━━━━━━━━
-
-إذا كان Volume ظاهرًا في الصورة، استخدمه كعامل تأكيد.
-
-افحص:
-
-- Volume أثناء Breakout.
-- Volume أثناء Rejection.
-- Volume مع الشموع القوية.
-- زيادة أو انخفاض Volume.
-- هل Volume يؤكد الحركة؟
-
-Breakout + Volume قوي:
-دليل إضافي على قوة الاختراق.
-
-Breakout + Volume ضعيف:
-احتمال Fake Breakout أعلى.
-
-حركة قوية + Volume متزايد:
-Momentum أقوى.
-
-حركة كبيرة + Volume ضعيف:
-تعامل معها بحذر.
-
-إذا لم يكن Volume ظاهرًا، اكتب:
-"غير ظاهر"
-
-ولا تخترع أي قراءة له.
-
-مهم:
-إذا كان الشارت OTC أو لا يمثل Volume حقيقيًا بشكل موثوق،
-لا تجعل Volume العامل الرئيسي في القرار.
-
-━━━━━━━━━━━━━━━━━━
-🎯 10. قرار الإشارة
-━━━━━━━━━━━━━━━━━━
-
-اجمع الأدلة من:
-
-Price Action
-+
-Candle Psychology
-+
-Market Structure
-+
-Liquidity
-+
-Momentum
-+
-Indicators
-+
-Chart Patterns
-+
-Volume إذا كان ظاهرًا
-
-لا تعتمد على عامل واحد.
-
-الأولوية عند وجود تعارض:
-
-1. Price Action + Candle Psychology
-2. Market Structure
-3. Liquidity
-4. Momentum
-5. Volume
-6. Chart Patterns
-7. Indicators
-
-هذه ليست معادلة رياضية ثابتة،
-بل ترتيب للأهمية عند تعارض الأدلة.
-
-اختر السيناريو الأقوى:
-
-🟢 CALL / UP = صعود
-🔴 PUT / DOWN = هبوط
-
-لا تستخدم NO SIGNAL.
-
-لكن لا تعطِ إشارة عشوائية.
-
-إذا كانت الأدلة متضاربة،
-اختر السيناريو الذي تدعمه الأدلة الأقوى
-وخفّض نسبة الثقة.
-
-لا ترفع الثقة لمجرد إعطاء رقم مرتفع.
-
-لا تستخدم ثقة 100%.
-
-━━━━━━━━━━━━━━━━━━
-⏱️ 11. وقت الدخول والمدة
-━━━━━━━━━━━━━━━━━━
-
-توقيت التحليل الحالي هو:
-
-{current_time}
-
-بتاريخ:
-
-{current_date}
-
-والمنطقة الزمنية:
-
-Africa/Algiers
-
-استخدم هذا الوقت كمرجع.
-
-لا تخترع توقيتًا بعيدًا.
-
-وقت الدخول يجب أن يكون قريبًا من وقت التحليل
-ومرتبطًا باكتمال شمعة التأكيد.
-
-لا تدخل أثناء تكون شمعة التأكيد.
-
-لا تفترض أن الشارت M1.
-
-استخدم الـTimeframe الظاهر في الصورة.
-
-حدد مدة صفقة مناسبة للـTimeframe وقوة الحركة.
-
-━━━━━━━━━━━━━━━━━━
-📋 12. OUTPUT
-━━━━━━━━━━━━━━━━━━
-
-أخرج النتيجة بهذا الشكل:
-
-📊 الأصل: [اسم الأصل]
-📊 الإطار الزمني: [Timeframe]
-
-🧭 الاتجاه الرئيسي: [صاعد / هابط / متذبذب]
-📈 الاتجاه القصير: [صاعد / هابط]
-
-━━━━━━━━━━━━━━━━━━
-
-🏗️ Market Structure
-[تحليل مختصر]
-
-💧 Liquidity
-[تحليل مختصر]
-
-⚡ Momentum
-[تحليل مختصر]
-
-📈 Technical Price Action
-[تحليل مختصر]
-
-🕯️ Candle Psychology
-[تحليل مختصر]
-
-🔄 التحول في سلوك السعر
-[تحليل مختصر]
-
-📊 المؤشرات
-[المؤشرات الظاهرة فقط]
-
-📐 Chart Pattern
-[النمط إن كان واضحًا، وإلا:
-لا يوجد نمط واضح]
-
-📦 Volume
-[التحليل إذا كان ظاهرًا،
-وإلا: غير ظاهر]
-
-🕯️ شمعة التأكيد
-[سبب اختيارها]
-
-🧠 السبب
-[الخلاصة الفنية المختصرة]
-
-━━━━━━━━━━━━━━━━━━
-
-🎯 الإشارة: [🟢 صعود (CALL / UP) أو 🔴 هبوط (PUT / DOWN)]
-🕐 وقت الدخول: [HH:MM]
-⏳ مدة الصفقة: [المدة]
-📊 نسبة الثقة: [XX%]
-
-قواعد نهائية:
-
-- إشارة واحدة فقط.
-- لا تستخدم NO SIGNAL.
-- لا تخترع بيانات غير ظاهرة.
-- لا تعتمد على مؤشر واحد.
-- لا تعتمد على شمعة واحدة.
-- لا تجعل UP وDOWN متساويين بشكل مصطنع.
-- لا ترفع نسبة الثقة بدون أدلة.
-- الأولوية لجودة نقطة الدخول.
-- اجعل التحليل واضحًا ومباشرًا.
-- لا تضف Support/Resistance في التقرير النهائي إلا إذا كان ضروريًا جدًا لتفسير القرار.
-- لا تقدم ضمانًا للربح.
-"""
-
-        # =================================================
-        # GEMINI ANALYSIS
-        # =================================================
+        prompt = ANALYSIS_PROMPT
 
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
-                types.Part.from_bytes(
-                    data=image_data,
-                    mime_type="image/jpeg"
-                ),
-                prompt
+                prompt,
+                image
             ]
         )
 
         result = response.text
 
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🟢 WIN",
-                    callback_data="win"
-                ),
-                InlineKeyboardButton(
-                    "🔴 LOSS",
-                    callback_data="loss"
-                )
-            ]
-        ]
+        if not result:
+            result = "⚠️ لم يتم الحصول على تحليل."
 
-        await status_message.edit_text(
-            result,
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            )
+        await update.message.reply_text(
+            result
         )
 
     except Exception as e:
 
-        print(
-            f"BOT ERROR: {repr(e)}"
-        )
-
-        await status_message.edit_text(
-            "❌ حدث خطأ أثناء تحليل الصورة.\n"
-            "حاول إرسال الشارت مرة أخرى."
+        await update.message.reply_text(
+            f"❌ حدث خطأ أثناء التحليل:\n\n{str(e)}"
         )
 
 
@@ -784,78 +383,33 @@ Africa/Algiers
 
 def main():
 
-    print(
-        "🚀 Starting ZinoQuotexSignalAI..."
-    )
-
-    health_thread = Thread(
-        target=start_health_server,
-        daemon=True
-    )
-
-    health_thread.start()
-
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+    app.add_handler(
+        CommandHandler("start", start)
     )
 
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_cmd
-        )
+    app.add_handler(
+        CommandHandler("help", help_command)
     )
 
-    application.add_handler(
-        CommandHandler(
-            "stats",
-            stats_cmd
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "reset",
-            reset_cmd
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            result_callback,
-            pattern="^(win|loss|reset_stats)$"
-        )
-    )
-
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.PHOTO,
-            photo
+            analyze_photo
         )
     )
 
-    print(
-        "🤖 Telegram bot starting..."
-    )
+    print("🤖 ZinoQuotexSignalAI is running...")
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
+    app.run_polling(
         drop_pending_updates=True
     )
 
-
-# =========================================================
-# RUN
-# =========================================================
 
 if __name__ == "__main__":
     main()
