@@ -1,316 +1,713 @@
 import os
 import io
+import json
+import re
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from PIL import Image
 from google import genai
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+Application,
+CommandHandler,
+MessageHandler,
+ContextTypes,
+filters,
 )
 
+============================================================
 
-# =========================
-# CONFIG
-# =========================
+ENVIRONMENT
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+OWNER_ID = os.getenv("OWNER_ID")
+
+if not BOT_TOKEN:
+raise RuntimeError("BOT_TOKEN is missing")
+
+if not GEMINI_API_KEY:
+raise RuntimeError("GEMINI_API_KEY is missing")
+
+if not OWNER_ID:
+raise RuntimeError("OWNER_ID is missing")
+
+OWNER_ID = int(OWNER_ID)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+============================================================
 
-# =========================
-# WIN / LOSS COUNTERS
-# =========================
+TRADE MEMORY
 
-WIN_COUNT = 0
-LOSS_COUNT = 0
+============================================================
 
+trades = []
+trade_counter = 0
 
-# =========================
-# RENDER HEALTH SERVER
-# =========================
+============================================================
 
-PORT = int(os.environ.get("PORT", 10000))
+HEALTH SERVER FOR RENDER
 
+============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
+def do_GET(self):
+self.send_response(200)
+self.end_headers()
+self.wfile.write(b"ZinoQuotexSignalAI is running")
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ZinoQuotexSignalAI is running")
-
-    def log_message(self, format, *args):
-        return
-
+def log_message(self, format, *args):
+    return
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
+port = int(os.environ.get("PORT", 10000))
+server = HTTPServer(("0.0.0.0", port), HealthHandler)
+server.serve_forever()
 
 Thread(target=run_health_server, daemon=True).start()
 
+============================================================
 
-# =========================
-# ANALYSIS PROMPT
-# =========================
+STRATEGY PROMPT
 
-ANALYSIS_PROMPT = """
-أنت محلل محترف لرسوم Quotex OTC على إطار M1.
+============================================================
 
-حلل صورة الشارت المرسلة فقط، ولا تخترع أي معلومات غير ظاهرة.
+SYSTEM_PROMPT = """
+أنت ZinoQuotexSignalAI، محلل فني متخصص في تحليل صور شارت التداول.
 
-اعتمد على:
+مهمتك تحليل الشارت الظاهر في الصورة فقط وإعطاء اتجاه تداول واضح
+CALL (UP) أو PUT (DOWN) بناءً على توافق عدة عوامل.
 
-1. Market Structure
-2. Liquidity
-3. Momentum
-4. Price Action
-5. Confirmation Candle
+هذه الاستراتيجية مبنية على:
 
-حدد الاتجاه الأقوى الحالي بناءً على حركة السعر والبنية والسيولة والزخم.
+1. Parabolic SAR
+2. Moving Average 5
+3. Moving Average 8
+4. Moving Average 13
+5. ADX / DI
 
-يجب أن تعطي إشارة واحدة فقط:
+إعدادات المؤشرات:
 
-🟢 CALL (UP)
-أو
-🔴 PUT (DOWN)
+PARABOLIC SAR:
 
-ممنوع إعطاء:
+- استخدم نقاط SAR الظاهرة على الشارت.
+- SAR أسفل السعر = ميل صاعد.
+- SAR أعلى السعر = ميل هابط.
+- تغير مكان SAR مهم، لكنه ليس تأكيدًا منفردًا.
+
+MOVING AVERAGES:
+
+- MA 5 = أخضر
+- MA 8 = أصفر
+- MA 13 = أحمر
+
+راقب:
+
+- ترتيب المتوسطات.
+- التقاطعات.
+- اتجاه الميل.
+- المسافة بينها.
+- هل المتوسطات مفتوحة ومتباعدة أم متداخلة.
+
+ترتيب صاعد:
+MA5 > MA8 > MA13
+
+ترتيب هابط:
+MA5 < MA8 < MA13
+
+ممنوع اعتبار تقاطع واحد وحده إشارة مؤكدة.
+
+ADX / DI:
+
+- DI Length = 9
+- ADX Smoothing = 7
+
+الخطوط:
+
+- DI+ = أخضر
+- DI- = برتقالي
+- ADX = أحمر
+
+عندما تكون الخطوط الثلاثة مفتوحة ومتباعدة وتتحرك في اتجاه واضح،
+اعتبر ذلك دليلًا على وجود حركة منظمة وقوية.
+
+عندما تبدأ الخطوط بالتقاطع والتداخل،
+اعتبر ذلك WARNING لاحتمال تغير الاتجاه أو ارتداد أو انعكاس.
+
+لكن لا تعتبر التقاطع وحده انعكاسًا مؤكدًا.
+
+يجب مقارنة ADX/DI مع:
+
+- Moving Averages
+- Parabolic SAR
+- Market Structure
+- Momentum
+- Price Action
+- Confirmation Candle
+
+========================
+MARKET STRUCTURE
+
+الاتجاه الصاعد:
+Higher High + Higher Low
+
+الاتجاه الهابط:
+Lower High + Lower Low
+
+راقب:
+
+- Break of Structure
+- Change of Character
+- استمرار الاتجاه
+- الارتداد
+- القمم والقيعان
+
+========================
+MOMENTUM
+
+BULLISH عندما:
+
+- السعر يتحرك للأعلى بقوة
+- MA5 فوق MA8 فوق MA13
+- DI+ أقوى من DI-
+- ADX يدعم قوة الحركة
+- SAR أسفل السعر
+
+BEARISH عندما:
+
+- السعر يتحرك للأسفل بقوة
+- MA5 تحت MA8 تحت MA13
+- DI- أقوى من DI+
+- ADX يدعم قوة الحركة
+- SAR أعلى السعر
+
+========================
+REVERSAL DETECTION
+
+إذا بدأت خطوط ADX/DI بالتقاطع:
+
+لا تعطي انعكاسًا مباشرة.
+
+ابحث عن توافق إضافي:
+
+ADX/DI crossover
++
+MA5/MA8/MA13 crossover
++
+تغير SAR
++
+تغير Market Structure
++
+Confirmation Candle
+
+كلما اجتمعت هذه العوامل، يصبح احتمال تغير الاتجاه أقوى.
+
+========================
+CALL CONDITIONS
+
+CALL عندما يكون هناك توافق صاعد واضح، مثل:
+
+- MA5 > MA8 > MA13
+- المتوسطات مائلة للأعلى
+- المتوسطات بدأت تتباعد
+- DI+ أقوى من DI-
+- ADX يدعم قوة الحركة
+- SAR أسفل السعر
+- Market Structure صاعد
+- Momentum صاعد
+- Confirmation Candle صاعدة
+
+لا يشترط وجود جميع العناصر، لكن يجب أن تكون الأغلبية متوافقة.
+
+========================
+PUT CONDITIONS
+
+PUT عندما يكون هناك توافق هابط واضح، مثل:
+
+- MA5 < MA8 < MA13
+- المتوسطات مائلة للأسفل
+- المتوسطات بدأت تتباعد
+- DI- أقوى من DI+
+- ADX يدعم قوة الحركة
+- SAR أعلى السعر
+- Market Structure هابط
+- Momentum هابط
+- Confirmation Candle هابطة
+
+لا يشترط وجود جميع العناصر، لكن يجب أن تكون الأغلبية متوافقة.
+
+========================
+AVOID BAD ENTRIES
+
+خفض الثقة عندما:
+
+- MA5/MA8/MA13 متشابكة.
+- ADX/DI متداخلة.
+- SAR يتغير باستمرار.
+- السعر يتحرك بشكل جانبي.
+- المؤشرات متناقضة.
+- لا توجد شمعة تأكيد واضحة.
+
+ممنوع إعطاء ثقة عالية عندما تكون الأدلة متضاربة.
+
+========================
+IMPORTANT
+
+ممنوع اختراع أي معلومة غير ظاهرة في الصورة.
+
+إذا لم يظهر:
+
+- اسم الأصل → اكتب غير واضح
+- الإطار الزمني → اكتب غير واضح
+
+لا تدّعي رؤية مؤشر غير موجود.
+
+لا تعتمد على لون المؤشر فقط.
+اعتمد على موقعه واتجاهه وعلاقته ببقية المؤشرات.
+
+========================
+SIGNAL RULE
+
+يجب دائمًا اختيار الاتجاه الذي تدعمه الأدلة الأقوى:
+
+CALL أو PUT
+
+لا تستخدم:
 NO SIGNAL
-NEUTRAL
-WAIT
-HOLD
 
-حتى لو كانت الحركة ضعيفة، اختر الاتجاه الذي تراه أقوى، لكن اجعل نسبة الثقة واقعية.
+إذا كانت الأدلة ضعيفة:
+اختر الاتجاه الأكثر دعمًا، لكن اخفض نسبة الثقة.
 
-نسبة الثقة يجب أن تكون بين 55% و85%.
+نسبة الثقة تقدير تحليلي وليست ضمانًا للنتيجة.
 
-لا تعتبر نسبة الثقة ضماناً للربح.
+لا تكتب 90% أو 95% بدون توافق قوي جدًا.
 
-استخدم هذا التنسيق بالضبط:
+========================
+OUTPUT FORMAT
+
+استخدم هذا الشكل بالضبط:
 
 🎯 الإشارة: 🟢 CALL (UP) XX%
 
 📊 نسبة الثقة: XX%
-📊 الأصل: ...
-📊 الإطار الزمني: M1
-🧭 الاتجاه: ...
-📈 الاتجاه القصير: ...
+📊 الأصل: [اسم الأصل]
+📊 الإطار الزمني: [M1/M5/...]
+🧭 الاتجاه: [Bullish/Bearish]
+📈 الاتجاه القصير: [Bullish/Bearish]
 
-🔹 Market Structure:
-...
+━━━━━━━━━━━━━━━━━━
+Market Structure
+━━━━━━━━━━━━━━━━━━
+[تحليل مختصر]
 
-🔹 Momentum:
-...
+━━━━━━━━━━━━━━━━━━
+ADX / DI
+━━━━━━━━━━━━━━━━━━
+[حالة DI+ وDI- وADX]
 
-🔹 Price Action:
-...
+━━━━━━━━━━━━━━━━━━
+Moving Averages
+━━━━━━━━━━━━━━━━━━
+[تحليل MA5 / MA8 / MA13]
 
-🔹 شمعة التأكيد:
-...
+━━━━━━━━━━━━━━━━━━
+Parabolic SAR
+━━━━━━━━━━━━━━━━━━
+[تحليل SAR]
 
-🔹 السبب:
-...
+━━━━━━━━━━━━━━━━━━
+Momentum
+━━━━━━━━━━━━━━━━━━
+[تحليل القوة]
 
-لا تضف Support / Resistance.
+━━━━━━━━━━━━━━━━━━
+Price Action
+━━━━━━━━━━━━━━━━━━
+[تحليل حركة السعر]
 
-لا تعطِ أكثر من إشارة واحدة.
+━━━━━━━━━━━━━━━━━━
+شمعة التأكيد
+━━━━━━━━━━━━━━━━━━
+[نوع شمعة التأكيد]
+
+━━━━━━━━━━━━━━━━━━
+السبب
+━━━━━━━━━━━━━━━━━━
+• السبب الأول
+• السبب الثاني
+• السبب الثالث
+
+========================
+TRADE RESULT
+
+لا تسجل WIN أو LOSS أثناء تحليل الصورة.
+
+بعد انتهاء الصفقة، يمكن للمستخدم إرسال:
+
+WIN
+
+أو:
+
+LOSS
+
+عندها يتم تسجيل النتيجة للصفقة الأخيرة.
+
+========================
+PERFORMANCE
+
+بعد تسجيل النتيجة اعرض:
+
+📊 إجمالي الصفقات: XX
+✅ WIN: XX
+❌ LOSS: XX
+🎯 WIN RATE: XX%
+📈 أفضل سلسلة WIN: XX
+📉 أطول سلسلة LOSS: XX
+
+WIN RATE =
+WIN ÷ إجمالي الصفقات × 100
+
+لا تغيّر الإشارة الأصلية بعد ظهور النتيجة.
 """
 
+============================================================
 
-# =========================
-# START
-# =========================
+OWNER CHECK
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+============================================================
 
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
+def is_owner(update: Update):
+user = update.effective_user
 
-    await update.message.reply_text(
-        "🤖 ZinoQuotexSignalAI جاهز.\n\n"
-        "📸 أرسل صورة الشارت لتحليلها.\n\n"
-        "🟢 /win — تسجيل صفقة رابحة\n"
-        "🔴 /loss — تسجيل صفقة خاسرة\n"
-        "📊 /stats — عرض الإحصائيات"
-    )
+if not user:
+    return False
 
+return user.id == OWNER_ID
 
-# =========================
-# HELP
-# =========================
+============================================================
+
+START
+
+============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+if not is_owner(update):
+    await update.message.reply_text("🔒 هذا البوت خاص.")
+    return
+
+await update.message.reply_text(
+    "🔥 ZinoQuotexSignalAI جاهز\n\n"
+    "📸 أرسل صورة الشارت M1.\n"
+    "وسأحلل:\n"
+    "• ADX / DI\n"
+    "• MA 5 / 8 / 13\n"
+    "• Parabolic SAR\n"
+    "• Market Structure\n"
+    "• Momentum\n"
+    "• Price Action\n"
+    "• Confirmation Candle\n\n"
+    "بعد الصفقة أرسل WIN أو LOSS لتسجيل النتيجة."
+)
+
+============================================================
+
+HELP
+
+============================================================
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
+if not is_owner(update):
+    return
 
-    await update.message.reply_text(
-        "📖 الأوامر:\n\n"
-        "/start - تشغيل البوت\n"
-        "/help - المساعدة\n"
-        "/win - تسجيل WIN\n"
-        "/loss - تسجيل LOSS\n"
-        "/stats - إحصائيات الصفقات\n\n"
-        "📸 أرسل صورة الشارت للحصول على التحليل."
+await update.message.reply_text(
+    "📖 الأوامر:\n\n"
+    "/start — تشغيل البوت\n"
+    "/help — المساعدة\n"
+    "/stats — إحصائيات WIN/LOSS\n\n"
+    "📸 أرسل الشارت للتحليل.\n"
+    "بعد انتهاء الصفقة أرسل WIN أو LOSS."
+)
+
+============================================================
+
+IMAGE ANALYSIS
+
+============================================================
+
+async def analyze_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+global trade_counter
+
+if not is_owner(update):
+    await update.message.reply_text("🔒 غير مصرح لك باستخدام هذا البوت.")
+    return
+
+if not update.message.photo:
+    return
+
+await update.message.reply_text(
+    "🔍 جاري تحليل الشارت...\n"
+    "ADX/DI + MA5/8/13 + SAR + Structure + Momentum"
+)
+
+try:
+
+    photo = update.message.photo[-1]
+
+    file = await context.bot.get_file(photo.file_id)
+
+    image_bytes = await file.download_as_bytearray()
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Resize image while preserving quality
+    image.thumbnail((1600, 1600))
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    buffer.seek(0)
+
+    prompt = SYSTEM_PROMPT + """
+
+حلل الصورة الحالية الآن.
+
+ركز على المؤشرات الظاهرة فعليًا في الصورة.
+
+لا تفترض وجود مؤشرات غير ظاهرة.
+
+أعطني إشارة واحدة فقط:
+CALL أو PUT.
+
+ثم أعطني التحليل بالشكل المطلوب.
+"""
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            prompt,
+            image,
+        ],
     )
 
+    result = response.text.strip()
 
-# =========================
-# WIN
-# =========================
+    trade_counter += 1
 
-async def win_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    global WIN_COUNT
+    trade = {
+        "id": trade_counter,
+        "time": now,
+        "signal": result,
+        "result": "PENDING",
+    }
 
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    WIN_COUNT += 1
-
-    await update.message.reply_text(
-        f"🟢 WIN تم تسجيلها بنجاح.\n\n"
-        f"🟢 WIN: {WIN_COUNT}\n"
-        f"🔴 LOSS: {LOSS_COUNT}"
-    )
-
-
-# =========================
-# LOSS
-# =========================
-
-async def loss_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    global LOSS_COUNT
-
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    LOSS_COUNT += 1
+    trades.append(trade)
 
     await update.message.reply_text(
-        f"🔴 LOSS تم تسجيلها بنجاح.\n\n"
-        f"🟢 WIN: {WIN_COUNT}\n"
-        f"🔴 LOSS: {LOSS_COUNT}"
+        f"🆔 الصفقة #{trade_counter}\n\n"
+        + result
+        + "\n\n"
+        "⏳ النتيجة: PENDING\n"
+        "بعد انتهاء الصفقة أرسل WIN أو LOSS."
     )
 
+except Exception as e:
 
-# =========================
-# STATS
-# =========================
+    await update.message.reply_text(
+        "❌ حدث خطأ أثناء التحليل:\n\n"
+        + str(e)
+    )
+
+============================================================
+
+RECORD WIN / LOSS
+
+============================================================
+
+async def result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+if not is_owner(update):
+    return
+
+text = update.message.text.strip().upper()
+
+if text not in ["WIN", "LOSS"]:
+    return
+
+if not trades:
+    await update.message.reply_text(
+        "⚠️ لا توجد صفقة مسجلة."
+    )
+    return
+
+# Find latest pending trade
+pending_trade = None
+
+for trade in reversed(trades):
+    if trade["result"] == "PENDING":
+        pending_trade = trade
+        break
+
+if not pending_trade:
+    await update.message.reply_text(
+        "⚠️ لا توجد صفقة Pending."
+    )
+    return
+
+pending_trade["result"] = text
+
+stats = calculate_stats()
+
+emoji = "✅" if text == "WIN" else "❌"
+
+await update.message.reply_text(
+    f"{emoji} تم تسجيل الصفقة #{pending_trade['id']} = {text}\n\n"
+    f"📊 إجمالي الصفقات: {stats['total']}\n"
+    f"✅ WIN: {stats['wins']}\n"
+    f"❌ LOSS: {stats['losses']}\n"
+    f"🎯 WIN RATE: {stats['win_rate']:.1f}%\n"
+    f"📈 أفضل سلسلة WIN: {stats['best_win_streak']}\n"
+    f"📉 أطول سلسلة LOSS: {stats['best_loss_streak']}"
+)
+
+============================================================
+
+STATISTICS
+
+============================================================
+
+def calculate_stats():
+
+completed = [
+    t for t in trades
+    if t["result"] in ["WIN", "LOSS"]
+]
+
+wins = sum(
+    1 for t in completed
+    if t["result"] == "WIN"
+)
+
+losses = sum(
+    1 for t in completed
+    if t["result"] == "LOSS"
+)
+
+total = len(completed)
+
+win_rate = (
+    wins / total * 100
+    if total > 0
+    else 0
+)
+
+best_win_streak = 0
+current_win = 0
+
+best_loss_streak = 0
+current_loss = 0
+
+for trade in completed:
+
+    if trade["result"] == "WIN":
+        current_win += 1
+        current_loss = 0
+
+        best_win_streak = max(
+            best_win_streak,
+            current_win
+        )
+
+    else:
+        current_loss += 1
+        current_win = 0
+
+        best_loss_streak = max(
+            best_loss_streak,
+            current_loss
+        )
+
+return {
+    "total": total,
+    "wins": wins,
+    "losses": losses,
+    "win_rate": win_rate,
+    "best_win_streak": best_win_streak,
+    "best_loss_streak": best_loss_streak,
+}
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
+if not is_owner(update):
+    return
 
-    total = WIN_COUNT + LOSS_COUNT
+stats = calculate_stats()
 
-    if total > 0:
-        win_rate = (WIN_COUNT / total) * 100
-    else:
-        win_rate = 0
+await update.message.reply_text(
+    "━━━━━━━━━━━━━━━━━━\n"
+    "📊 SESSION RESULTS\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+    f"📌 إجمالي الصفقات: {stats['total']}\n"
+    f"✅ WIN: {stats['wins']}\n"
+    f"❌ LOSS: {stats['losses']}\n"
+    f"🎯 WIN RATE: {stats['win_rate']:.1f}%\n"
+    f"📈 أفضل سلسلة WIN: {stats['best_win_streak']}\n"
+    f"📉 أطول سلسلة LOSS: {stats['best_loss_streak']}"
+)
 
-    await update.message.reply_text(
-        "📊 إحصائيات الصفقات\n\n"
-        f"🟢 WIN: {WIN_COUNT}\n"
-        f"🔴 LOSS: {LOSS_COUNT}\n"
-        f"📈 المجموع: {total}\n"
-        f"🎯 نسبة النجاح: {win_rate:.2f}%"
-    )
+============================================================
 
+TELEGRAM APPLICATION
 
-# =========================
-# PHOTO ANALYSIS
-# =========================
-
-async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    message = await update.message.reply_text(
-        "🔍 جاري تحليل الشارت..."
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        file = await context.bot.get_file(photo.file_id)
-
-        image_bytes = await file.download_as_bytearray()
-
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-        image.thumbnail((1400, 1400))
-
-        prompt = ANALYSIS_PROMPT
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[prompt, image]
-        )
-
-        result = response.text
-
-        await message.edit_text(result)
-
-    except Exception as e:
-
-        await message.edit_text(
-            f"❌ حدث خطأ أثناء التحليل:\n\n{e}"
-        )
-
-
-# =========================
-# MAIN
-# =========================
+============================================================
 
 def main():
 
-    app = Application.builder().token(BOT_TOKEN).build()
+application = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .build()
+)
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
+application.add_handler(
+    CommandHandler("start", start)
+)
 
-    # WIN / LOSS / STATS
-    app.add_handler(CommandHandler("win", win_command))
-    app.add_handler(CommandHandler("loss", loss_command))
-    app.add_handler(CommandHandler("stats", stats_command))
+application.add_handler(
+    CommandHandler("help", help_command)
+)
 
-    # PHOTO
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            analyze_photo
-        )
+application.add_handler(
+    CommandHandler("stats", stats_command)
+)
+
+application.add_handler(
+    MessageHandler(
+        filters.PHOTO,
+        analyze_chart
     )
+)
 
-    print("🤖 ZinoQuotexSignalAI is running...")
-
-    app.run_polling(
-        drop_pending_updates=True
+application.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        result_handler
     )
+)
 
+print("🚀 ZinoQuotexSignalAI started")
 
-if __name__ == "__main__":
-    main()
+application.run_polling(
+    drop_pending_updates=True
+)
+
+if name == "main":
+main()
