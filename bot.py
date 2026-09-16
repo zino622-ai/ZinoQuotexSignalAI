@@ -1,24 +1,16 @@
 import os
 import io
-import json
-import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from PIL import Image
 from google import genai
 from telegram import Update
-from telegram.ext import (
-Application,
-CommandHandler,
-MessageHandler,
-ContextTypes,
-filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 ============================================================
 
-ENVIRONMENT
+SETTINGS
 
 ============================================================
 
@@ -42,7 +34,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 ============================================================
 
-TRADE MEMORY
+TRADE STORAGE
 
 ============================================================
 
@@ -51,15 +43,16 @@ trade_counter = 0
 
 ============================================================
 
-HEALTH SERVER FOR RENDER
+RENDER HEALTH SERVER
 
 ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
+
 def do_GET(self):
-self.send_response(200)
-self.end_headers()
-self.wfile.write(b"ZinoQuotexSignalAI is running")
+    self.send_response(200)
+    self.end_headers()
+    self.wfile.write(b"ZinoQuotexSignalAI is running")
 
 def log_message(self, format, *args):
     return
@@ -73,17 +66,20 @@ Thread(target=run_health_server, daemon=True).start()
 
 ============================================================
 
-STRATEGY PROMPT
+ANALYSIS PROMPT
 
 ============================================================
 
 SYSTEM_PROMPT = """
 أنت ZinoQuotexSignalAI، محلل فني متخصص في تحليل صور شارت التداول.
 
-مهمتك تحليل الشارت الظاهر في الصورة فقط وإعطاء اتجاه تداول واضح
-CALL (UP) أو PUT (DOWN) بناءً على توافق عدة عوامل.
+مهمتك تحليل الشارت الظاهر في الصورة فقط وإعطاء اتجاه تداول واضح:
+CALL (UP) أو PUT (DOWN).
 
-هذه الاستراتيجية مبنية على:
+لا تعتمد على مؤشر واحد.
+يجب دمج جميع الأدلة الظاهرة في الصورة.
+
+المؤشرات الأساسية:
 
 1. Parabolic SAR
 2. Moving Average 5
@@ -91,20 +87,18 @@ CALL (UP) أو PUT (DOWN) بناءً على توافق عدة عوامل.
 4. Moving Average 13
 5. ADX / DI
 
-إعدادات المؤشرات:
-
 PARABOLIC SAR:
 
-- استخدم نقاط SAR الظاهرة على الشارت.
 - SAR أسفل السعر = ميل صاعد.
 - SAR أعلى السعر = ميل هابط.
-- تغير مكان SAR مهم، لكنه ليس تأكيدًا منفردًا.
+- انتقال SAR من أعلى السعر إلى أسفله أو العكس مهم.
+- لا تستخدم SAR وحده لاتخاذ القرار.
 
 MOVING AVERAGES:
 
-- MA 5 = أخضر
-- MA 8 = أصفر
-- MA 13 = أحمر
+MA 5 = أخضر
+MA 8 = أصفر
+MA 13 = أحمر
 
 راقب:
 
@@ -112,185 +106,174 @@ MOVING AVERAGES:
 - التقاطعات.
 - اتجاه الميل.
 - المسافة بينها.
-- هل المتوسطات مفتوحة ومتباعدة أم متداخلة.
+- هل المتوسطات مفتوحة ومتباعدة؟
+- هل المتوسطات متداخلة ومتشابكة؟
 
-ترتيب صاعد:
+الترتيب الصاعد:
+
 MA5 > MA8 > MA13
 
-ترتيب هابط:
+الترتيب الهابط:
+
 MA5 < MA8 < MA13
 
-ممنوع اعتبار تقاطع واحد وحده إشارة مؤكدة.
+التقاطع وحده ليس إشارة مؤكدة.
 
 ADX / DI:
 
-- DI Length = 9
-- ADX Smoothing = 7
+DI Length = 9
+ADX Smoothing = 7
 
 الخطوط:
 
-- DI+ = أخضر
-- DI- = برتقالي
-- ADX = أحمر
+DI+ = أخضر
+DI- = برتقالي
+ADX = أحمر
 
 عندما تكون الخطوط الثلاثة مفتوحة ومتباعدة وتتحرك في اتجاه واضح،
 اعتبر ذلك دليلًا على وجود حركة منظمة وقوية.
 
 عندما تبدأ الخطوط بالتقاطع والتداخل،
-اعتبر ذلك WARNING لاحتمال تغير الاتجاه أو ارتداد أو انعكاس.
+اعتبر ذلك تحذيرًا من احتمال تغير الاتجاه أو ارتداد أو انعكاس.
 
 لكن لا تعتبر التقاطع وحده انعكاسًا مؤكدًا.
 
-يجب مقارنة ADX/DI مع:
-
-- Moving Averages
-- Parabolic SAR
-- Market Structure
-- Momentum
-- Price Action
-- Confirmation Candle
-
-========================
-MARKET STRUCTURE
+MARKET STRUCTURE:
 
 الاتجاه الصاعد:
-Higher High + Higher Low
+
+Higher High
+Higher Low
 
 الاتجاه الهابط:
-Lower High + Lower Low
+
+Lower High
+Lower Low
 
 راقب:
 
-- Break of Structure
-- Change of Character
-- استمرار الاتجاه
-- الارتداد
-- القمم والقيعان
+- استمرار الاتجاه.
+- Break of Structure.
+- تغير البنية.
+- القمم والقيعان.
+- الارتداد.
 
-========================
-MOMENTUM
+MOMENTUM:
 
 BULLISH عندما:
 
-- السعر يتحرك للأعلى بقوة
-- MA5 فوق MA8 فوق MA13
-- DI+ أقوى من DI-
-- ADX يدعم قوة الحركة
-- SAR أسفل السعر
+- السعر يتحرك للأعلى بقوة.
+- MA5 فوق MA8 فوق MA13.
+- DI+ أقوى من DI-.
+- ADX يدعم قوة الحركة.
+- SAR أسفل السعر.
 
 BEARISH عندما:
 
-- السعر يتحرك للأسفل بقوة
-- MA5 تحت MA8 تحت MA13
-- DI- أقوى من DI+
-- ADX يدعم قوة الحركة
-- SAR أعلى السعر
+- السعر يتحرك للأسفل بقوة.
+- MA5 تحت MA8 تحت MA13.
+- DI- أقوى من DI+.
+- ADX يدعم قوة الحركة.
+- SAR أعلى السعر.
 
-========================
-REVERSAL DETECTION
+REVERSAL:
 
-إذا بدأت خطوط ADX/DI بالتقاطع:
+إذا بدأت خطوط ADX/DI بالتقاطع والتداخل،
+لا تعتبر ذلك انعكاسًا مباشرة.
 
-لا تعطي انعكاسًا مباشرة.
+ابحث عن تأكيد من:
 
-ابحث عن توافق إضافي:
-
-ADX/DI crossover
+ADX/DI
 +
-MA5/MA8/MA13 crossover
+MA5/MA8/MA13
 +
-تغير SAR
+Parabolic SAR
 +
-تغير Market Structure
+Market Structure
++
+Price Action
 +
 Confirmation Candle
 
-كلما اجتمعت هذه العوامل، يصبح احتمال تغير الاتجاه أقوى.
+كلما اجتمعت الأدلة، زادت قوة احتمال تغير الاتجاه.
 
-========================
-CALL CONDITIONS
+CALL:
 
-CALL عندما يكون هناك توافق صاعد واضح، مثل:
+أعط CALL عندما يكون هناك توافق صاعد واضح:
 
-- MA5 > MA8 > MA13
-- المتوسطات مائلة للأعلى
-- المتوسطات بدأت تتباعد
-- DI+ أقوى من DI-
-- ADX يدعم قوة الحركة
-- SAR أسفل السعر
-- Market Structure صاعد
-- Momentum صاعد
-- Confirmation Candle صاعدة
+- MA5 فوق MA8 فوق MA13.
+- المتوسطات مائلة للأعلى.
+- المتوسطات بدأت تتباعد.
+- DI+ أقوى من DI-.
+- ADX يدعم الحركة.
+- SAR أسفل السعر.
+- Market Structure صاعد.
+- Momentum صاعد.
+- شمعة تأكيد صاعدة.
 
-لا يشترط وجود جميع العناصر، لكن يجب أن تكون الأغلبية متوافقة.
+PUT:
 
-========================
-PUT CONDITIONS
+أعط PUT عندما يكون هناك توافق هابط واضح:
 
-PUT عندما يكون هناك توافق هابط واضح، مثل:
+- MA5 تحت MA8 تحت MA13.
+- المتوسطات مائلة للأسفل.
+- المتوسطات بدأت تتباعد.
+- DI- أقوى من DI+.
+- ADX يدعم الحركة.
+- SAR أعلى السعر.
+- Market Structure هابط.
+- Momentum هابط.
+- شمعة تأكيد هابطة.
 
-- MA5 < MA8 < MA13
-- المتوسطات مائلة للأسفل
-- المتوسطات بدأت تتباعد
-- DI- أقوى من DI+
-- ADX يدعم قوة الحركة
-- SAR أعلى السعر
-- Market Structure هابط
-- Momentum هابط
-- Confirmation Candle هابطة
+تجنب الإشارة القوية عندما:
 
-لا يشترط وجود جميع العناصر، لكن يجب أن تكون الأغلبية متوافقة.
-
-========================
-AVOID BAD ENTRIES
-
-خفض الثقة عندما:
-
-- MA5/MA8/MA13 متشابكة.
+- المتوسطات متشابكة.
 - ADX/DI متداخلة.
 - SAR يتغير باستمرار.
-- السعر يتحرك بشكل جانبي.
+- السوق جانبي.
 - المؤشرات متناقضة.
 - لا توجد شمعة تأكيد واضحة.
 
-ممنوع إعطاء ثقة عالية عندما تكون الأدلة متضاربة.
+ممنوع استخدام NO SIGNAL.
 
-========================
-IMPORTANT
+يجب اختيار الاتجاه الذي تدعمه الأدلة الأقوى:
 
-ممنوع اختراع أي معلومة غير ظاهرة في الصورة.
+CALL أو PUT.
 
-إذا لم يظهر:
+إذا كانت الأدلة ضعيفة، اختر الاتجاه الأكثر دعمًا
+ولكن اخفض نسبة الثقة.
 
-- اسم الأصل → اكتب غير واضح
-- الإطار الزمني → اكتب غير واضح
+CONFIDENCE:
+
+نسبة الثقة تقدير تحليلي وليست ضمانًا للنتيجة.
+
+ثقة مرتفعة:
+عندما تتفق معظم المؤشرات مع بعضها.
+
+ثقة متوسطة:
+عندما تكون أغلب المؤشرات متفقة مع وجود بعض التناقض.
+
+ثقة منخفضة:
+عندما تكون الأدلة متضاربة أو السوق متذبذبًا.
+
+لا تكتب 90% أو 95% بدون توافق قوي جدًا.
+
+IMPORTANT:
+
+لا تخترع معلومات غير ظاهرة في الصورة.
+
+إذا لم يظهر اسم الأصل:
+اكتب غير واضح.
+
+إذا لم يظهر الإطار الزمني:
+اكتب غير واضح.
 
 لا تدّعي رؤية مؤشر غير موجود.
 
 لا تعتمد على لون المؤشر فقط.
 اعتمد على موقعه واتجاهه وعلاقته ببقية المؤشرات.
 
-========================
-SIGNAL RULE
-
-يجب دائمًا اختيار الاتجاه الذي تدعمه الأدلة الأقوى:
-
-CALL أو PUT
-
-لا تستخدم:
-NO SIGNAL
-
-إذا كانت الأدلة ضعيفة:
-اختر الاتجاه الأكثر دعمًا، لكن اخفض نسبة الثقة.
-
-نسبة الثقة تقدير تحليلي وليست ضمانًا للنتيجة.
-
-لا تكتب 90% أو 95% بدون توافق قوي جدًا.
-
-========================
-OUTPUT FORMAT
-
-استخدم هذا الشكل بالضبط:
+OUTPUT FORMAT:
 
 🎯 الإشارة: 🟢 CALL (UP) XX%
 
@@ -308,7 +291,7 @@ Market Structure
 ━━━━━━━━━━━━━━━━━━
 ADX / DI
 ━━━━━━━━━━━━━━━━━━
-[حالة DI+ وDI- وADX]
+[تحليل الخطوط الثلاثة]
 
 ━━━━━━━━━━━━━━━━━━
 Moving Averages
@@ -342,37 +325,19 @@ Price Action
 • السبب الثاني
 • السبب الثالث
 
-========================
-TRADE RESULT
+IMPORTANT TRADE RULE:
 
-لا تسجل WIN أو LOSS أثناء تحليل الصورة.
+بعد تحليل الصورة، سجل الصفقة على أنها PENDING.
 
-بعد انتهاء الصفقة، يمكن للمستخدم إرسال:
+لا تسجل WIN أو LOSS من نفسك.
+
+النتيجة يتم تسجيلها فقط عندما يرسل المستخدم:
 
 WIN
 
 أو:
 
 LOSS
-
-عندها يتم تسجيل النتيجة للصفقة الأخيرة.
-
-========================
-PERFORMANCE
-
-بعد تسجيل النتيجة اعرض:
-
-📊 إجمالي الصفقات: XX
-✅ WIN: XX
-❌ LOSS: XX
-🎯 WIN RATE: XX%
-📈 أفضل سلسلة WIN: XX
-📉 أطول سلسلة LOSS: XX
-
-WIN RATE =
-WIN ÷ إجمالي الصفقات × 100
-
-لا تغيّر الإشارة الأصلية بعد ظهور النتيجة.
 """
 
 ============================================================
@@ -382,6 +347,7 @@ OWNER CHECK
 ============================================================
 
 def is_owner(update: Update):
+
 user = update.effective_user
 
 if not user:
@@ -403,16 +369,8 @@ if not is_owner(update):
 
 await update.message.reply_text(
     "🔥 ZinoQuotexSignalAI جاهز\n\n"
-    "📸 أرسل صورة الشارت M1.\n"
-    "وسأحلل:\n"
-    "• ADX / DI\n"
-    "• MA 5 / 8 / 13\n"
-    "• Parabolic SAR\n"
-    "• Market Structure\n"
-    "• Momentum\n"
-    "• Price Action\n"
-    "• Confirmation Candle\n\n"
-    "بعد الصفقة أرسل WIN أو LOSS لتسجيل النتيجة."
+    "📸 أرسل صورة الشارت M1 للتحليل.\n\n"
+    "بعد انتهاء الصفقة أرسل WIN أو LOSS."
 )
 
 ============================================================
@@ -430,14 +388,14 @@ await update.message.reply_text(
     "📖 الأوامر:\n\n"
     "/start — تشغيل البوت\n"
     "/help — المساعدة\n"
-    "/stats — إحصائيات WIN/LOSS\n\n"
-    "📸 أرسل الشارت للتحليل.\n"
+    "/stats — الإحصائيات\n\n"
+    "📸 أرسل صورة الشارت للتحليل.\n"
     "بعد انتهاء الصفقة أرسل WIN أو LOSS."
 )
 
 ============================================================
 
-IMAGE ANALYSIS
+CHART ANALYSIS
 
 ============================================================
 
@@ -446,14 +404,13 @@ async def analyze_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 global trade_counter
 
 if not is_owner(update):
-    await update.message.reply_text("🔒 غير مصرح لك باستخدام هذا البوت.")
-    return
-
-if not update.message.photo:
+    await update.message.reply_text(
+        "🔒 غير مصرح لك باستخدام هذا البوت."
+    )
     return
 
 await update.message.reply_text(
-    "🔍 جاري تحليل الشارت...\n"
+    "🔍 جاري تحليل الشارت...\n\n"
     "ADX/DI + MA5/8/13 + SAR + Structure + Momentum"
 )
 
@@ -461,26 +418,35 @@ try:
 
     photo = update.message.photo[-1]
 
-    file = await context.bot.get_file(photo.file_id)
+    telegram_file = await context.bot.get_file(
+        photo.file_id
+    )
 
-    image_bytes = await file.download_as_bytearray()
+    image_bytes = await telegram_file.download_as_bytearray()
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = Image.open(
+        io.BytesIO(image_bytes)
+    ).convert("RGB")
 
-    # Resize image while preserving quality
     image.thumbnail((1600, 1600))
 
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=95)
+
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=95
+    )
+
     buffer.seek(0)
 
     prompt = SYSTEM_PROMPT + """
 
 حلل الصورة الحالية الآن.
 
-ركز على المؤشرات الظاهرة فعليًا في الصورة.
+افحص المؤشرات الظاهرة فعليًا.
 
-لا تفترض وجود مؤشرات غير ظاهرة.
+لا تفترض وجود مؤشر غير ظاهر.
 
 أعطني إشارة واحدة فقط:
 CALL أو PUT.
@@ -492,29 +458,28 @@ CALL أو PUT.
         model=GEMINI_MODEL,
         contents=[
             prompt,
-            image,
-        ],
+            image
+        ]
     )
 
     result = response.text.strip()
 
     trade_counter += 1
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     trade = {
         "id": trade_counter,
-        "time": now,
-        "signal": result,
-        "result": "PENDING",
+        "time": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "analysis": result,
+        "result": "PENDING"
     }
 
     trades.append(trade)
 
     await update.message.reply_text(
         f"🆔 الصفقة #{trade_counter}\n\n"
-        + result
-        + "\n\n"
+        f"{result}\n\n"
         "⏳ النتيجة: PENDING\n"
         "بعد انتهاء الصفقة أرسل WIN أو LOSS."
     )
@@ -523,12 +488,12 @@ except Exception as e:
 
     await update.message.reply_text(
         "❌ حدث خطأ أثناء التحليل:\n\n"
-        + str(e)
+        f"{str(e)}"
     )
 
 ============================================================
 
-RECORD WIN / LOSS
+WIN / LOSS
 
 ============================================================
 
@@ -544,19 +509,21 @@ if text not in ["WIN", "LOSS"]:
 
 if not trades:
     await update.message.reply_text(
-        "⚠️ لا توجد صفقة مسجلة."
+        "⚠️ لا توجد صفقات مسجلة."
     )
     return
 
-# Find latest pending trade
 pending_trade = None
 
 for trade in reversed(trades):
+
     if trade["result"] == "PENDING":
+
         pending_trade = trade
         break
 
 if not pending_trade:
+
     await update.message.reply_text(
         "⚠️ لا توجد صفقة Pending."
     )
@@ -569,7 +536,8 @@ stats = calculate_stats()
 emoji = "✅" if text == "WIN" else "❌"
 
 await update.message.reply_text(
-    f"{emoji} تم تسجيل الصفقة #{pending_trade['id']} = {text}\n\n"
+    f"{emoji} تم تسجيل الصفقة "
+    f"#{pending_trade['id']} = {text}\n\n"
     f"📊 إجمالي الصفقات: {stats['total']}\n"
     f"✅ WIN: {stats['wins']}\n"
     f"❌ LOSS: {stats['losses']}\n"
@@ -587,18 +555,21 @@ STATISTICS
 def calculate_stats():
 
 completed = [
-    t for t in trades
-    if t["result"] in ["WIN", "LOSS"]
+    trade
+    for trade in trades
+    if trade["result"] in ["WIN", "LOSS"]
 ]
 
 wins = sum(
-    1 for t in completed
-    if t["result"] == "WIN"
+    1
+    for trade in completed
+    if trade["result"] == "WIN"
 )
 
 losses = sum(
-    1 for t in completed
-    if t["result"] == "LOSS"
+    1
+    for trade in completed
+    if trade["result"] == "LOSS"
 )
 
 total = len(completed)
@@ -610,29 +581,31 @@ win_rate = (
 )
 
 best_win_streak = 0
-current_win = 0
+current_win_streak = 0
 
 best_loss_streak = 0
-current_loss = 0
+current_loss_streak = 0
 
 for trade in completed:
 
     if trade["result"] == "WIN":
-        current_win += 1
-        current_loss = 0
+
+        current_win_streak += 1
+        current_loss_streak = 0
 
         best_win_streak = max(
             best_win_streak,
-            current_win
+            current_win_streak
         )
 
     else:
-        current_loss += 1
-        current_win = 0
+
+        current_loss_streak += 1
+        current_win_streak = 0
 
         best_loss_streak = max(
             best_loss_streak,
-            current_loss
+            current_loss_streak
         )
 
 return {
@@ -641,8 +614,14 @@ return {
     "losses": losses,
     "win_rate": win_rate,
     "best_win_streak": best_win_streak,
-    "best_loss_streak": best_loss_streak,
+    "best_loss_streak": best_loss_streak
 }
+
+============================================================
+
+STATS COMMAND
+
+============================================================
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -665,7 +644,7 @@ await update.message.reply_text(
 
 ============================================================
 
-TELEGRAM APPLICATION
+MAIN
 
 ============================================================
 
