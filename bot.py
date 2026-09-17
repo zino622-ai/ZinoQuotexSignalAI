@@ -1,9 +1,9 @@
 import os
 import io
-from threading import Thread
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from PIL import Image
-from google import genai
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,15 +12,26 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from google import genai
+from google.genai import types
+
 
 # ============================================================
-# ENVIRONMENT VARIABLES
+# ZinoQuotexSignalAI
+# Candle + Swing + Breakout Analysis
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-OWNER_ID = os.environ.get("OWNER_ID")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OWNER_ID = os.getenv("OWNER_ID")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+# Algeria time
+ALGERIA_TZ = ZoneInfo("Africa/Algiers")
+
+# Quotex chart timezone requested by user: UTC-3
+QUOTEX_TZ = ZoneInfo("Etc/GMT+3")
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -28,586 +39,324 @@ if not BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-if not OWNER_ID:
-    raise RuntimeError("OWNER_ID is missing")
-
-OWNER_ID = int(OWNER_ID)
-
-# ============================================================
-# GEMINI
-# ============================================================
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+
 # ============================================================
-# ZINOQUOTEXSIGNALAI MASTER PROMPT
+# ACCESS CONTROL
 # ============================================================
 
-PROMPT = """
-You are ZinoQuotexSignalAI, an advanced short-term chart analysis engine specialized in analyzing trading chart screenshots.
-
-Your task is to analyze the uploaded chart image and determine the strongest probable direction for the NEXT candle.
-
-You must analyze the entire visible chart before making the final decision.
-
-Do not simply describe the chart.
-
-Use a multi-layer decision system based on:
-
-1. Market Structure
-2. Liquidity
-3. Momentum
-4. Price Action
-5. Pullback Analysis
-6. Breakout Validation
-7. Reversal Analysis
-8. Confirmation
-9. Market Context
-10. Internal Scoring
-11. False-Signal Filtering
-
-Never reveal hidden reasoning or internal calculations.
-
-============================================================
-MARKET STRUCTURE
-============================================================
-
-Analyze the visible price structure.
-
-Look for:
-
-Higher High
-Higher Low
-Lower High
-Lower Low
-Break of Structure (BOS)
-Change of Character (CHOCH)
-Trend continuation
-Trend weakening
-Structural failure
-Potential reversal
-
-Determine:
-
-Main Trend:
-Bullish / Bearish / Ranging
-
-Short-Term Trend:
-Bullish / Bearish
-
-Do not determine the trend from one candle.
-
-Give greater importance to repeated structure across multiple candles.
-
-============================================================
-LIQUIDITY
-============================================================
-
-Look for visible liquidity behavior:
-
-Liquidity Sweep
-Stop Hunt
-Fake Breakout
-Sweep above previous high
-Sweep below previous low
-Rejection after sweep
-Failed Breakout
-Breakout followed by immediate return
-
-If price takes a previous high and quickly rejects below it, consider possible bearish liquidity behavior.
-
-If price takes a previous low and quickly rejects above it, consider possible bullish liquidity behavior.
-
-Never invent liquidity events.
-
-============================================================
-MOMENTUM
-============================================================
-
-Analyze:
-
-Candle size
-Candle sequence
-Speed of movement
-Strength of closes
-Expansion
-Compression
-Acceleration
-Deceleration
-Momentum continuation
-Momentum exhaustion
-
-Classify momentum internally as:
-
-Strong Bullish
-Moderate Bullish
-Weak Bullish
-Strong Bearish
-Moderate Bearish
-Weak Bearish
-Increasing
-Decreasing
-Exhausted
-
-Do not reverse a strong trend because of one small opposite candle.
-
-============================================================
-PRICE ACTION
-============================================================
-
-Analyze the latest group of candles.
-
-Look for:
-
-Bullish Engulfing
-Bearish Engulfing
-Pin Bar
-Rejection Wick
-Strong Bullish Candle
-Strong Bearish Candle
-Inside Bar
-Breakout Candle
-Failed Breakout
-Compression
-Expansion
-Consecutive candles
-Strong Close
-Weak Close
-Long Upper Wick
-Long Lower Wick
-
-Evaluate:
-
-Body strength
-Wick behavior
-Closing position
-Relationship between consecutive candles
-Reaction after breakout
-Reaction after liquidity sweep
-
-Never use candle color alone as the reason for a signal.
-
-============================================================
-PULLBACK VS REVERSAL
-============================================================
-
-Distinguish between a temporary pullback and a real reversal.
-
-If the main trend is Bullish and price moves temporarily downward:
-
-Check for:
-
-Lower High
-Lower Low
-Bearish momentum
-Structural break
-Failed bullish continuation
-Bearish confirmation
-
-If these are absent, treat the movement as a possible bullish pullback.
-
-If the main trend is Bearish and price moves temporarily upward:
-
-Check for:
-
-Higher Low
-Higher High
-Bullish momentum
-Structural break
-Failed bearish continuation
-Bullish confirmation
-
-If these are absent, treat the movement as a possible bearish pullback.
-
-============================================================
-BREAKOUT VALIDATION
-============================================================
-
-Do not automatically trust every breakout.
-
-Check:
-
-Breakout candle strength
-Closing position
-Follow-through
-Momentum
-Immediate rejection
-Return inside previous range
-Continuation
-
-Strong breakout + strong momentum + confirmation
-= strong evidence.
-
-Weak breakout + long wick + immediate return
-= possible fake breakout.
-
-============================================================
-REVERSAL ANALYSIS
-============================================================
-
-Do not call a reversal from one candle.
-
-Look for a combination of:
-
-Liquidity event
-Rejection
-Momentum change
-Structure change
-Confirmation
-
-The more factors agree, the stronger the reversal evidence.
-
-============================================================
-CONFIRMATION ENGINE
-============================================================
-
-Before the final decision, search for confirmation.
-
-Possible confirmations:
-
-Strong continuation candle
-Bullish Engulfing
-Bearish Engulfing
-Strong rejection
-Confirmed BOS
-Confirmed CHOCH
-Liquidity Sweep followed by reversal
-Breakout followed by continuation
-Momentum confirmation
-Multiple consecutive candles
-
-Do not treat a weak candle as strong confirmation.
-
-============================================================
-MARKET CONTEXT
-============================================================
-
-Classify the current market internally as:
-
-TRENDING
-PULLBACK
-RANGING
-BREAKOUT
-REVERSAL
-EXHAUSTION
-
-If the market is highly choppy or unclear, reduce confidence.
-
-If Structure + Liquidity + Momentum + Price Action + Confirmation agree, increase confidence.
-
-============================================================
-INTERNAL SCORING
-============================================================
-
-Internally calculate evidence strength out of 100.
-
-Market Structure = 25
-Liquidity = 20
-Momentum = 15
-Price Action = 15
-Confirmation = 15
-Market Context = 10
-
-Compare:
-
-CALL / UP
-
-versus:
-
-PUT / DOWN
-
-The score is internal only.
-
-Never display the detailed score.
-
-============================================================
-FALSE SIGNAL FILTER
-============================================================
-
-Before the final decision actively search for evidence against the current direction.
-
-Check:
-
-Fake Breakout
-Liquidity Trap
-Exhaustion
-Weak Momentum
-Conflicting Structure
-Conflicting Price Action
-Excessive Wicks
-Choppy Market
-Failed Continuation
-Sudden Reversal
-Weak Confirmation
-
-If opposing evidence exists:
-
-Choose the direction supported by stronger evidence and reduce confidence.
-
-============================================================
-CONFIDENCE
-============================================================
-
-50-59% = weak
-60-69% = moderate
-70-79% = good
-80-89% = strong
-90-94% = exceptional
-95%+ = extremely rare
-
-Never give high confidence because of one candle.
-
-Never give 90%+ when structure and momentum conflict.
-
-Never give 90%+ without meaningful confirmation.
-
-The percentage represents evidence strength, NOT a guarantee.
-
-============================================================
-M1 SPECIAL RULES
-============================================================
-
-When the timeframe is M1:
-
-Use stricter analysis.
-
-M1 is highly sensitive to:
-
-Noise
-Fake Breakouts
-Short Liquidity Sweeps
-Rapid Momentum Changes
-Candle Exhaustion
-Rapid Reversals
-
-Therefore focus heavily on:
-
-Recent Structure
-Liquidity
-Momentum
-Price Action
-Confirmation
-
-Do not make the decision from one candle.
-
-============================================================
-OTC RULES
-============================================================
-
-If the asset is OTC:
-
-Analyze only what is visible in the chart.
-
-Do not claim to know hidden broker algorithms.
-
-Do not claim guaranteed knowledge of Quotex OTC behavior.
-
-Use the visible price action and structure.
-
-============================================================
-INDICATORS
-============================================================
-
-If indicators are visible, they can be supporting evidence.
-
-Possible indicators:
-
-Moving Average
-RSI
-MACD
-Bollinger Bands
-Stochastic
-Volume
-ZigZag
-
-Never allow one indicator to override clear price action and market structure.
-
-Never invent indicator values.
-
-============================================================
-FINAL DECISION
-============================================================
-
-You MUST choose exactly ONE:
-
-CALL (UP)
-
-OR
-
-PUT (DOWN)
-
-Never output:
-
-NO SIGNAL
-NEUTRAL
-WAIT
-UNKNOWN
-SKIP
-
-If evidence is weak or conflicting, still choose the stronger direction and lower the confidence.
-
-============================================================
-ENTRY TIME
-============================================================
-
-The user wants ENTRY TIME ONLY.
-
-Entry time means the beginning of the NEXT candle.
-
-Do not provide expiration.
-
-Do not provide expiration duration.
-
-Do not provide expiration time.
-
-Do not provide a second time.
-
-Use UTC-3.
-
-For M1:
-Next candle = next minute.
-
-For M5:
-Next candle = next 5-minute candle.
-
-For M15:
-Next candle = next 15-minute candle.
-
-Output only the entry time in HH:MM format.
-
-============================================================
-IMAGE ANALYSIS
-============================================================
-
-Before deciding:
-
-1. Identify the asset if visible.
-2. Identify the timeframe if visible.
-3. Identify the current candle.
-4. Inspect the entire visible chart.
-5. Analyze previous candles.
-6. Analyze the latest candles.
-7. Compare current movement with previous structure.
-8. Search for liquidity.
-9. Analyze momentum.
-10. Search for confirmation.
-11. Filter false signals.
-12. Make the final decision.
-
-Never invent information that cannot be seen.
-
-============================================================
-FINAL OUTPUT FORMAT
-============================================================
-
-Return EXACTLY this structure:
-
-🎯 الإشارة: [🟢 CALL (UP) أو 🔴 PUT (DOWN)] XX%
-
+def is_owner(user_id: int) -> bool:
+    if not OWNER_ID:
+        return True
+
+    try:
+        return str(user_id) == str(int(OWNER_ID))
+    except Exception:
+        return str(user_id) == str(OWNER_ID)
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+
+    if not is_owner(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "🤖 ZinoQuotexSignalAI جاهز.\n\n"
+        "📸 أرسل Screenshot للشارت وسأحلله."
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+
+    if not is_owner(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "📸 أرسل صورة شارت Quotex.\n\n"
+        "سيتم التركيز على:\n"
+        "🕯️ افتتاح وإغلاق الشموع\n"
+        "📉 القمم والقيعان\n"
+        "💥 الانكسارات\n"
+        "🔄 Fake Breakout\n"
+        "🎯 اتجاه الصفقة\n"
+        "⏱️ الدخول مع بداية الشمعة القادمة"
+    )
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def get_times():
+    now_algeria = datetime.now(ALGERIA_TZ)
+    now_quotex = now_algeria.astimezone(QUOTEX_TZ)
+
+    # بداية الشمعة القادمة على إطار M1
+    next_minute = (now_quotex + timedelta(minutes=1)).replace(
+        second=0,
+        microsecond=0
+    )
+
+    return now_algeria, now_quotex, next_minute
+
+
+# ============================================================
+# GEMINI PROMPT
+# ============================================================
+
+ANALYSIS_PROMPT = """
+أنت محلل Price Action متخصص في تحليل شارتات Quotex M1.
+
+حلل الصورة فقط بناءً على ما يظهر فعليًا في الشارت.
+
+الأولوية القصوى للتحليل تكون بهذا الترتيب:
+
+1. إغلاق الشموع:
+- قوة الإغلاق.
+- مكان الإغلاق داخل جسم الشمعة.
+- طول الفتيل العلوي والسفلي.
+- هل الإغلاق يؤكد الحركة أو يرفضها.
+
+2. افتتاح الشموع:
+- سلوك افتتاح الشمعة التالية.
+- هل الافتتاح يؤكد اتجاه الشمعة السابقة.
+- هل يوجد رفض أو انعكاس عند الافتتاح.
+
+3. القمم والقيعان:
+- Swing High.
+- Swing Low.
+- Higher High.
+- Higher Low.
+- Lower High.
+- Lower Low.
+- راقب تسلسل القمم والقيعان وليس شمعة واحدة فقط.
+
+4. الانكسارات:
+- Breakout لقمة سابقة.
+- Breakdown لقاع سابق.
+- هل الكسر قوي ومؤكد بالإغلاق.
+- هل الكسر مجرد Fake Breakout.
+- راقب Liquidity Sweep فوق القمم أو تحت القيعان.
+
+5. Price Action:
+- قوة الدفع.
+- رفض السعر.
+- استمرار الحركة.
+- انعكاس الحركة.
+- شمعة التأكيد الأخيرة.
+
+ممنوع الاعتماد الأساسي على RSI أو MACD أو أي مؤشر آخر.
+الشموع + القمم والقيعان + الانكسارات هي الأساس.
+
+مهم جدًا:
+- لا تقل NO SIGNAL.
+- يجب أن تختار اتجاهًا واحدًا فقط: CALL أو PUT.
+- لا تعطِ اتجاهًا محايدًا.
+- إذا كانت الإشارة ضعيفة، اختر الاتجاه الذي تدعمه البنية السعرية والإغلاق الأخير، مع خفض نسبة الثقة.
+- لا تختر الاتجاه عشوائيًا.
+- لا تختر CALL فقط لأن آخر شمعة خضراء.
+- لا تختر PUT فقط لأن آخر شمعة حمراء.
+- لا تعتمد على لون شمعة واحدة.
+- افحص تسلسل القمم والقيعان والانكسارات أولًا.
+
+الإطار الزمني:
+M1.
+
+الدخول:
+يكون الدخول فقط في بداية الشمعة القادمة.
+
+لا تعطِ وقت انتهاء.
+
+أرجع النتيجة بهذا الشكل بالضبط:
+
+🎯 الإشارة: 🟢 CALL (UP) XX%
 📊 نسبة الثقة: XX%
-📊 الأصل: [Asset]
-📊 الإطار الزمني: [M1 / M5 / M15]
-🕐 وقت الدخول: [HH:MM]
-🧭 الاتجاه: [Bullish / Bearish / Ranging]
-📈 الاتجاه القصير: [Bullish / Bearish]
+📊 الأصل: [اسم الأصل الظاهر في الصورة]
+📊 الإطار الزمني: 1M
+⏱️ وقت الدخول: [سيتم وضعه من البوت]
 
-━━━━━━━━━━━━━━━━━━━━
+🧭 الاتجاه: [Bullish أو Bearish]
+📈 الاتجاه القصير: [Bullish أو Bearish]
+
 Market Structure
-━━━━━━━━━━━━━━━━━━━━
+[تحليل القمم والقيعان والانكسار باختصار]
 
-[Brief analysis]
-
-━━━━━━━━━━━━━━━━━━━━
 Momentum
-━━━━━━━━━━━━━━━━━━━━
+[تحليل قوة الحركة الحالية]
 
-[Brief analysis]
-
-━━━━━━━━━━━━━━━━━━━━
 Price Action
-━━━━━━━━━━━━━━━━━━━━
+[تحليل سلوك الشموع]
 
-[Brief analysis]
-
-━━━━━━━━━━━━━━━━━━━━
 شمعة التأكيد
-━━━━━━━━━━━━━━━━━━━━
+[اذكر آخر شمعة أو شمعة التأكيد ولماذا]
 
-[Brief confirmation analysis]
-
-━━━━━━━━━━━━━━━━━━━━
 السبب
-━━━━━━━━━━━━━━━━━━━━
+[سبب مختصر ومباشر لاختيار CALL أو PUT]
 
-[Strongest 2-4 reasons]
-
-============================================================
-FINAL RULES
-============================================================
-
-Analyze the entire chart before deciding.
-
-Never rely on one candle.
-
-Never rely on one indicator.
-
-Never invent data.
-
-Never invent liquidity.
-
-Never invent a breakout.
-
-Never invent confirmation.
-
-Never invent indicator values.
-
-Never invent timeframe.
-
-Never invent asset name.
-
-Always output CALL or PUT.
-
-Never output NO SIGNAL.
-
-Never output NEUTRAL.
-
-Never output WAIT.
-
-Never output UNKNOWN.
-
-Give only one final direction.
-
-Do not show internal scoring.
-
-Do not reveal hidden reasoning.
-
-Do not mention Support/Resistance.
-
-Do not provide expiration.
-
-Do not provide expiration duration.
-
-Do not provide expiration time.
-
-Provide ENTRY TIME only.
-
-Use UTC-3.
-
-Entry time means the beginning of the next candle.
-
-Keep the final analysis concise.
-
-The confidence percentage represents the strength of visible evidence and is not a guarantee of the trade outcome.
+قواعد مهمة:
+- لا تضف Support/Resistance.
+- لا تضف مؤشرات.
+- لا تضف أي قسم غير الأقسام المطلوبة.
+- لا تذكر أنك نموذج ذكاء اصطناعي.
+- لا تقل إن التحليل مضمون.
+- لا تستخدم كلمة NO SIGNAL.
+- الاتجاه يجب أن يكون CALL أو PUT فقط.
+- نسبة الثقة بين 50% و95%.
+- يجب أن تكون النسبة منطقية حسب قوة الأدلة الظاهرة في الشارت.
 """
 
+
 # ============================================================
-# RENDER HEALTH SERVER
+# IMAGE ANALYSIS
 # ============================================================
 
-PORT = int(os.environ.get("PORT", 10000))
+async def analyze_chart(image_bytes: bytes) -> str:
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # تصغير الصورة إذا كانت كبيرة حتى تكون أخف على API
+        max_size = 1600
+
+        if image.width > max_size or image.height > max_size:
+            image.thumbnail((max_size, max_size))
+
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=92)
+        output.seek(0)
+
+        image_part = types.Part.from_bytes(
+            data=output.getvalue(),
+            mime_type="image/jpeg"
+        )
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=[
+                ANALYSIS_PROMPT,
+                image_part,
+            ],
+        )
+
+        if not response or not response.text:
+            raise RuntimeError("Gemini returned an empty response")
+
+        return response.text.strip()
+
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+# ============================================================
+# CLEAN GEMINI OUTPUT
+# ============================================================
+
+def clean_analysis(text: str, entry_time: str) -> str:
+    text = text.strip()
+
+    # منع Gemini من إضافة وقت مختلف
+    lines = text.splitlines()
+    cleaned = []
+
+    for line in lines:
+        lower = line.lower()
+
+        if "وقت الدخول" in line:
+            cleaned.append(f"⏱️ وقت الدخول: {entry_time}")
+        else:
+            cleaned.append(line)
+
+    text = "\n".join(cleaned)
+
+    # إذا Gemini لم يضع وقت الدخول
+    if "⏱️ وقت الدخول:" not in text:
+        text = text.rstrip() + f"\n⏱️ وقت الدخول: {entry_time}"
+
+    return text
+
+
+# ============================================================
+# PHOTO HANDLER
+# ============================================================
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+
+    if not is_owner(update.effective_user.id):
+        return
+
+    photo = update.message.photo
+
+    if not photo:
+        return
+
+    processing_message = await update.message.reply_text(
+        "🔎 جاري تحليل الشارت..."
+    )
+
+    try:
+        file = await photo[-1].get_file()
+        image_bytes = await file.download_as_bytearray()
+
+        _, _, next_candle = get_times()
+
+        # وقت الدخول حسب توقيت Quotex UTC-3
+        entry_time = next_candle.strftime("%H:%M")
+
+        result = await analyze_chart(bytes(image_bytes))
+
+        result = clean_analysis(
+            result,
+            entry_time
+        )
+
+        await processing_message.edit_text(result)
+
+    except Exception as e:
+        error_text = str(e)
+
+        if len(error_text) > 1000:
+            error_text = error_text[:1000]
+
+        await processing_message.edit_text(
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{error_text}"
+        )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("ERROR:", context.error)
+
+
+# ============================================================
+# HEALTH SERVER FOR RENDER
+# ============================================================
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 
 class HealthHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -618,93 +367,39 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    print(f"Health server running on port {port}")
+
     server.serve_forever()
-
-
-Thread(target=run_health_server, daemon=True).start()
-
-# ============================================================
-# TELEGRAM COMMANDS
-# ============================================================
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    await update.message.reply_text(
-        "👋 أهلاً بك في ZinoQuotexSignalAI\n\n"
-        "📸 أرسل صورة الشارت وسأقوم بتحليلها."
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    await update.message.reply_text(
-        "📸 أرسل Screenshot واضح للشارت.\n"
-        "🧠 سيتم تحليل Structure + Liquidity + Momentum + Price Action + Confirmation."
-    )
-
-
-# ============================================================
-# IMAGE ANALYSIS
-# ============================================================
-
-
-async def analyze_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ هذا البوت خاص.")
-        return
-
-    status_message = await update.message.reply_text(
-        "🔍 جاري تحليل الشارت..."
-    )
-
-    try:
-        photo = update.message.photo[-1]
-
-        telegram_file = await context.bot.get_file(photo.file_id)
-
-        image_bytes = await telegram_file.download_as_bytearray()
-
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-        # Resize large screenshots to reduce unnecessary payload
-        image.thumbnail((1400, 1400))
-
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[
-                image,
-                PROMPT,
-            ],
-        )
-
-        result = response.text
-
-        if not result:
-            raise RuntimeError("Gemini returned an empty response.")
-
-        await status_message.edit_text(result)
-
-    except Exception as e:
-        await status_message.edit_text(
-            f"❌ حدث خطأ أثناء التحليل:\n\n{str(e)}"
-        )
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-
 def main():
+    print("==============================================")
+    print("ZinoQuotexSignalAI")
+    print("Candle + Swing + Breakout Analysis")
+    print("==============================================")
+    print(f"Gemini model: {GEMINI_MODEL}")
+    print("Telegram bot starting...")
+
+    # Render health server
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True
+    )
+
+    health_thread.start()
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -720,13 +415,19 @@ def main():
     )
 
     application.add_handler(
-        MessageHandler(filters.PHOTO, analyze_photo)
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
+        )
     )
 
-    print("🚀 ZinoQuotexSignalAI is running...")
+    application.add_error_handler(error_handler)
+
+    print("Bot is running.")
 
     application.run_polling(
-        drop_pending_updates=True
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
     )
 
 
