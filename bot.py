@@ -1,11 +1,8 @@
 import os
-import io
-import json
 import re
-import threading
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from PIL import Image
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,31 +11,23 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from google import genai
 from google.genai import types
+
+from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 # ============================================================
-# ZinoQuotexSignalAI
-# Fast Smart Chart Analysis
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = os.getenv("OWNER_ID")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
-
-# Fallback فقط عند 503 / 429 / مشاكل مؤقتة
-FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -46,818 +35,701 @@ if not BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+if not OWNER_ID:
+    raise RuntimeError("OWNER_ID is missing")
+
+
+OWNER_ID = int(OWNER_ID)
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ============================================================
+# TIME ZONES
+# ============================================================
 
 ALGERIA_TZ = ZoneInfo("Africa/Algiers")
 
-# توقيت Quotex المطلوب
+# Quotex timezone requested by the user: UTC-3
 QUOTEX_TZ = ZoneInfo("Etc/GMT+3")
 
-stats = {
-    "win": 0,
-    "loss": 0,
-}
+
+# ============================================================
+# SIMPLE STATS
+# ============================================================
+
+wins = 0
+losses = 0
 
 
 # ============================================================
-# OWNER
+# OWNER CHECK
 # ============================================================
 
-def is_owner(user_id):
+def is_owner(update: Update) -> bool:
+    if not update.effective_user:
+        return False
 
-    if not OWNER_ID:
-        return True
-
-    try:
-        return str(user_id) == str(int(OWNER_ID))
-    except Exception:
-        return str(user_id) == str(OWNER_ID)
+    return update.effective_user.id == OWNER_ID
 
 
 # ============================================================
-# TIME
+# TIME FUNCTIONS
 # ============================================================
 
-def get_quotex_time():
-
-    return datetime.now(
-        ALGERIA_TZ
-    ).astimezone(
-        QUOTEX_TZ
-    )
+def get_quotex_now():
+    return datetime.now(QUOTEX_TZ)
 
 
-def calculate_entry_time(delay_minutes):
+def calculate_entry_time(minutes_ahead: int):
+    """
+    Calculates the beginning of the future candle.
 
-    now = get_quotex_time()
+    Example:
+    current time 21:17
+    delay 3
+    entry = 21:20
+    """
 
-    # بداية الشمعة القادمة
-    next_candle = (
-        now + timedelta(minutes=1)
-    ).replace(
+    now = get_quotex_now()
+
+    future = now + timedelta(minutes=minutes_ahead)
+
+    entry = future.replace(
         second=0,
         microsecond=0
     )
 
-    entry = next_candle + timedelta(
-        minutes=delay_minutes - 1
-    )
-
-    return entry.strftime("%H:%M")
+    return entry
 
 
 # ============================================================
-# FAST ANALYSIS PROMPT
+# ANALYSIS PROMPT
 # ============================================================
 
-ANALYSIS_PROMPT = """
-أنت محلل فني متخصص في تحليل صور شارت Quotex.
+ANALYSIS_PROMPT = r"""
+You are an advanced technical analyst for short-term binary-options style chart analysis.
 
-حلل الصورة فقط.
-لا تخترع أي معلومة غير ظاهرة.
+Analyze ONLY the attached chart screenshot.
 
-الهدف:
-إعطاء CALL أو PUT مع تحديد أفضل وقت للدخول بناءً على حالة السوق الحالية.
+IMPORTANT:
 
-لا تفترض أن الفريم M1.
-اقرأ الفريم الظاهر في الشارت إذا كان واضحًا.
+1. Do NOT assume the timeframe is M1.
+   Read the timeframe from the chart if visible.
+   If the timeframe is visible, use it.
+   If it is not visible, write "غير واضح".
 
-حلل بالترتيب:
+2. You MUST give either:
+   CALL
+   or
+   PUT
 
-1. Market Structure
-- Higher High / Higher Low
-- Lower High / Lower Low
-- Trend أو Consolidation
-
-2. Price Action
-- قوة الشموع
-- مكان الإغلاق
-- الرفض
-- الفتائل
-- قوة الحركة
-
-3. Support / Resistance
-- استخدم القمم والقيعان الظاهرة.
-- لا تدخل بمجرد لمس المستوى.
-- انتظر تأكيد الشمعة.
-
-4. Confirmation
-راقب:
-- Hammer / Pin Bar
-- Bullish Engulfing
-- Bearish Engulfing
-- rejection candle
-- strong close
-
-5. Momentum
-حدد هل الحركة الحالية قوية أم ضعيفة.
-
-6. RSI
-استخدمه فقط إذا كان ظاهرًا بوضوح.
-
-7. EMA 5 / EMA 13
-استخدمهما فقط إذا كانا ظاهرين بوضوح.
-
-لا تخترع RSI أو EMA.
-
-============================================================
-قرار الصفقة
-============================================================
-
-اختر اتجاهًا واحدًا فقط:
-
-CALL
-أو
-PUT
-
-ممنوع:
+Never answer:
 NO SIGNAL
 NEUTRAL
+WAIT
 
-إذا كانت الأدلة ضعيفة، اختر الاتجاه الذي تدعمه الأدلة أكثر وخفض الثقة.
+3. The analysis must determine the best practical entry moment.
 
-============================================================
-وقت الدخول
-============================================================
+Do NOT automatically choose 1 minute.
 
-هذه أهم نقطة.
+Choose ENTRY_DELAY_MINUTES intelligently:
 
-لا تجعل الدخول دائمًا بعد دقيقة.
+1 = price is already confirmed and entry can be taken at the next appropriate candle.
+2 = a little confirmation is still needed.
+3 = stronger confirmation is preferred.
+4 = significant confirmation/waiting is needed.
+5 = wait for a clearer setup.
 
-حدد ENTRY_DELAY_MINUTES بناءً على التحليل الفعلي:
+The delay must be between 1 and 5 minutes.
 
-1 = فرصة جاهزة وقوية ويمكن الدخول قريبًا.
+The entry should be at the BEGINNING of that future candle.
 
-2 = الاتجاه واضح لكن يحتاج شمعة إضافية أو تأكيدًا بسيطًا.
+4. Main strategy:
 
-3 = يحتاج تأكيدًا إضافيًا أو السعر يحتاج وقتًا للوصول لمنطقة الدخول.
+UPTREND:
+- Higher Highs
+- Higher Lows
+- Prefer CALL
 
-4 أو 5 = إذا كان الاتجاه واضحًا لكن أفضلية الدخول تحتاج انتظارًا أطول.
+DOWNTREND:
+- Lower Highs
+- Lower Lows
+- Prefer PUT
 
-لا تختار الرقم عشوائيًا.
+CONSOLIDATION:
+- Identify horizontal movement between boundaries.
+- Consider reactions from support/resistance.
+- Do not blindly follow the middle of the range.
 
-إذا كان السعر عند دعم/مقاومة بدون تأكيد:
-لا تعتبر اللحظة الحالية دخولًا.
-اختر وقتًا يسمح بظهور التأكيد.
+5. Support / Resistance:
 
-ENTRY_DELAY_MINUTES يجب أن يكون رقمًا صحيحًا من 1 إلى 5.
+Use visible support and resistance as part of the reasoning.
 
-============================================================
-الثقة
-============================================================
+Near SUPPORT:
+Look for CALL only after bullish confirmation.
 
-الثقة بين 50 و95.
+Near RESISTANCE:
+Look for PUT only after bearish confirmation.
 
-اربط الثقة بقوة الأدلة الفعلية.
+Do NOT enter immediately when price touches a level.
+Wait for candle confirmation.
 
-لا تقل إن الصفقة مضمونة.
+6. Candlestick confirmation:
 
-============================================================
-إخراج JSON فقط
-============================================================
+Look for:
+- Hammer
+- Pin Bar
+- Bullish Engulfing
+- Bearish Engulfing
+- Strong rejection wick
+- Strong momentum candle
+- Break and confirmation
 
-أرجع JSON صالح فقط بهذا الشكل:
+Hammer / bullish rejection:
+Long lower wick + small body can support CALL.
 
-{
-  "signal": "CALL",
-  "confidence": 78,
-  "asset": "EUR/USD",
-  "timeframe": "1M",
-  "direction": "Bullish",
-  "short_direction": "Bullish",
-  "entry_delay_minutes": 2,
-  "market_structure": "شرح مختصر",
-  "momentum": "شرح مختصر",
-  "price_action": "شرح مختصر",
-  "confirmation_candle": "نوع شمعة التأكيد",
-  "reason": "سبب مباشر ومختصر"
-}
+Bearish rejection:
+Long upper wick + small body can support PUT.
 
-القواعد:
+Bullish engulfing:
+Supports CALL when appearing in the correct location.
 
-- signal يجب أن يكون CALL أو PUT فقط.
-- confidence رقم بين 50 و95.
-- entry_delay_minutes رقم صحيح من 1 إلى 5.
-- لا تستخدم NO SIGNAL.
-- لا تستخدم NEUTRAL.
-- لا تخترع اسم الأصل.
-- لا تخترع الفريم.
-- إذا الفريم غير واضح اكتب "غير واضح".
-- لا تخترع RSI.
-- لا تخترع EMA.
-- لا تضف MACD.
-- لا تضف Stochastic.
-- لا تضف Fibonacci.
-- لا تضف ZigZag.
-- لا تضف مؤشرات أخرى.
-- لا تضف وقت انتهاء.
-- لا تكتب أي شيء خارج JSON.
+Bearish engulfing:
+Supports PUT when appearing in the correct location.
+
+7. RSI:
+
+If RSI is visible:
+- Above 70 = overbought, possible downside/reversal
+- Below 30 = oversold, possible upside/reversal
+
+Do NOT invent RSI values if RSI is not visible.
+
+8. EMA 5 and EMA 13:
+
+If EMA 5 and EMA 13 are visible:
+- EMA 5 above EMA 13 supports CALL
+- EMA 5 below EMA 13 supports PUT
+- A clear crossover can strengthen the signal
+
+Do NOT invent EMA values if they are not visible.
+
+9. Do NOT use:
+- MACD
+- Stochastic
+- Fibonacci
+- ZigZag
+- Random indicators not visible on the chart
+
+10. Priority:
+
+Market Structure
++
+Support/Resistance reaction
++
+Liquidity/rejection
++
+Momentum
++
+Candlestick confirmation
++
+RSI/EMA only when visible
+
+11. Confidence:
+
+Give a realistic confidence percentage.
+
+Do not always use high confidence.
+
+Example:
+60
+68
+74
+81
+
+12. VERY IMPORTANT MACHINE-READABLE LINES:
+
+At the end of your answer, you MUST include EXACTLY these three lines:
+
+SIGNAL: CALL
+
+CONFIDENCE: 72
+
+ENTRY_DELAY_MINUTES: 3
+
+Replace the values according to your actual analysis.
+
+SIGNAL must be exactly CALL or PUT.
+
+CONFIDENCE must be a number from 50 to 95.
+
+ENTRY_DELAY_MINUTES must be an integer from 1 to 5.
+
+Do not omit these lines.
+
+13. Keep the analysis concise.
+
+Use this format:
+
+🎯 الإشارة: 🟢 CALL (UP) 72%
+
+📊 نسبة الثقة: 72%
+📊 الأصل: ...
+📊 الإطار الزمني: ...
+🧭 الاتجاه: ...
+📈 الاتجاه القصير: ...
+
+🏗 Market Structure:
+...
+
+⚡ Momentum:
+...
+
+📊 Price Action:
+...
+
+🕯 شمعة التأكيد:
+...
+
+💡 السبب:
+...
+
+SIGNAL: CALL
+CONFIDENCE: 72
+ENTRY_DELAY_MINUTES: 3
 """
 
 
 # ============================================================
-# TEMPORARY ERROR DETECTION
+# EXTRACT SIGNAL
 # ============================================================
 
-def is_temporary_error(error):
+def extract_signal(text: str):
+    """
+    Extract CALL or PUT from the dedicated SIGNAL line.
+    """
 
-    text = str(error).upper()
+    match = re.search(
+        r"SIGNAL\s*:\s*(CALL|PUT)",
+        text,
+        re.IGNORECASE
+    )
 
-    temporary = [
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "UNAVAILABLE",
-        "RESOURCE_EXHAUSTED",
-        "OVERLOADED",
-        "HIGH DEMAND",
+    if match:
+        return match.group(1).upper()
+
+    # Fallback if Gemini forgot the machine-readable line
+    upper = text.upper()
+
+    if re.search(r"\bCALL\b", upper):
+        return "CALL"
+
+    if re.search(r"\bPUT\b", upper):
+        return "PUT"
+
+    return None
+
+
+# ============================================================
+# EXTRACT CONFIDENCE
+# ============================================================
+
+def extract_confidence(text: str):
+    match = re.search(
+        r"CONFIDENCE\s*:\s*(\d{1,3})",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        value = int(match.group(1))
+
+        if 50 <= value <= 95:
+            return value
+
+    # Fallback for Arabic / normal confidence text
+    patterns = [
+        r"نسبة الثقة\s*[:：]?\s*(\d{1,3})",
+        r"الثقة\s*[:：]?\s*(\d{1,3})",
+        r"(\d{1,3})\s*%",
     ]
 
-    return any(
-        item in text
-        for item in temporary
-    )
-
-
-# ============================================================
-# JSON CLEANER
-# ============================================================
-
-def parse_json_response(text):
-
-    if not text:
-        raise RuntimeError(
-            "Gemini returned an empty response"
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
         )
 
-    text = text.strip()
+        if match:
+            value = int(match.group(1))
 
-    # محاولة مباشرة
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+            if 50 <= value <= 95:
+                return value
 
-    # إزالة markdown code fence
-    text = re.sub(
-        r"```json\s*",
-        "",
+    return None
+
+
+# ============================================================
+# EXTRACT ENTRY DELAY
+# ============================================================
+
+def extract_entry_delay(text: str):
+    """
+    Extract ENTRY_DELAY_MINUTES.
+
+    IMPORTANT:
+    Never silently default to 1.
+    """
+
+    match = re.search(
+        r"ENTRY_DELAY_MINUTES\s*:\s*(\d+)",
         text,
-        flags=re.IGNORECASE
+        re.IGNORECASE
     )
 
-    text = re.sub(
-        r"```\s*",
+    if match:
+        value = int(match.group(1))
+
+        if 1 <= value <= 5:
+            return value
+
+    # Fallback patterns
+    patterns = [
+        r"دقائق\s*[:：]?\s*(\d+)",
+        r"بعد\s*(\d+)\s*دقائق",
+        r"بعد\s*(\d+)\s*دقيقة",
+        r"دخول\s*بعد\s*(\d+)",
+        r"entry\s*(?:after|in)\s*(\d+)\s*minutes?",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            value = int(match.group(1))
+
+            if 1 <= value <= 5:
+                return value
+
+    return None
+
+
+# ============================================================
+# CLEAN GEMINI RESULT
+# ============================================================
+
+def clean_result(
+    text: str,
+    signal: str,
+    confidence: int,
+    entry_delay: int
+):
+    """
+    Removes machine-readable lines from the visible output.
+    """
+
+    lines = text.splitlines()
+
+    cleaned = []
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        if re.match(
+            r"SIGNAL\s*:",
+            stripped,
+            re.IGNORECASE
+        ):
+            continue
+
+        if re.match(
+            r"CONFIDENCE\s*:",
+            stripped,
+            re.IGNORECASE
+        ):
+            continue
+
+        if re.match(
+            r"ENTRY_DELAY_MINUTES\s*:",
+            stripped,
+            re.IGNORECASE
+        ):
+            continue
+
+        cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+
+    # Remove accidental old entry-time lines from Gemini
+    result = re.sub(
+        r"(?im)^.*وقت الدخول.*$\n?",
         "",
-        text
+        result
     )
 
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # استخراج أول JSON object
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start != -1 and end != -1 and end > start:
-
-        candidate = text[
-            start:end + 1
-        ]
-
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    raise RuntimeError(
-        "Gemini returned invalid JSON"
+    result = re.sub(
+        r"(?im)^.*ENTRY TIME.*$\n?",
+        "",
+        result
     )
 
-
-# ============================================================
-# VALIDATE ANALYSIS
-# ============================================================
-
-def validate_analysis(data):
-
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "Invalid analysis format"
-        )
-
-    signal = str(
-        data.get("signal", "")
-    ).upper().strip()
-
-    if signal not in [
-        "CALL",
-        "PUT"
-    ]:
-        raise RuntimeError(
-            "Invalid signal from Gemini"
-        )
-
-    # confidence
-    try:
-        confidence = int(
-            data.get(
-                "confidence",
-                50
-            )
-        )
-    except Exception:
-        confidence = 50
-
-    confidence = max(
-        50,
-        min(95, confidence)
-    )
-
-    # entry delay
-    try:
-        delay = int(
-            data.get(
-                "entry_delay_minutes"
-            )
-        )
-    except Exception:
-        raise RuntimeError(
-            "Gemini did not provide a valid entry delay"
-        )
-
-    # مهم:
-    # لا نرجع تلقائيًا إلى 1 دقيقة.
-    if delay < 1 or delay > 5:
-        raise RuntimeError(
-            "Invalid entry delay"
-        )
-
-    data["signal"] = signal
-    data["confidence"] = confidence
-    data["entry_delay_minutes"] = delay
-
-    data["asset"] = str(
-        data.get(
-            "asset",
-            "غير واضح"
-        )
-    ).strip()
-
-    data["timeframe"] = str(
-        data.get(
-            "timeframe",
-            "غير واضح"
-        )
-    ).strip()
-
-    data["direction"] = str(
-        data.get(
-            "direction",
-            "غير واضح"
-        )
-    ).strip()
-
-    data["short_direction"] = str(
-        data.get(
-            "short_direction",
-            "غير واضح"
-        )
-    ).strip()
-
-    data["market_structure"] = str(
-        data.get(
-            "market_structure",
-            ""
-        )
-    ).strip()
-
-    data["momentum"] = str(
-        data.get(
-            "momentum",
-            ""
-        )
-    ).strip()
-
-    data["price_action"] = str(
-        data.get(
-            "price_action",
-            ""
-        )
-    ).strip()
-
-    data["confirmation_candle"] = str(
-        data.get(
-            "confirmation_candle",
-            ""
-        )
-    ).strip()
-
-    data["reason"] = str(
-        data.get(
-            "reason",
-            ""
-        )
-    ).strip()
-
-    return data
+    return result.strip()
 
 
 # ============================================================
-# GENERATE WITH MODEL
+# FORMAT FINAL RESULT
 # ============================================================
 
-def generate_analysis(
-    model_name,
-    image_part
+def format_result(
+    analysis: str,
+    signal: str,
+    confidence: int,
+    entry_time,
+    entry_delay: int
 ):
 
-    print(
-        f"Trying Gemini: {model_name}"
-    )
+    if signal == "CALL":
+        direction = "🟢 CALL (UP)"
+    else:
+        direction = "🔴 PUT (DOWN)"
 
-    config = types.GenerateContentConfig(
-        temperature=0.2,
-        response_mime_type="application/json",
-        max_output_tokens=700,
-    )
+    final_text = f"""
+🎯 الإشارة: {direction} {confidence}%
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            ANALYSIS_PROMPT,
-            image_part
-        ],
-        config=config
-    )
+📊 نسبة الثقة: {confidence}%
+⏱️ وقت الدخول: {entry_time.strftime("%H:%M")}
+⏳ بعد: {entry_delay} دقيقة
 
-    if not response or not response.text:
-        raise RuntimeError(
-            "Empty Gemini response"
-        )
+{analysis}
+""".strip()
 
-    data = parse_json_response(
-        response.text
-    )
-
-    data = validate_analysis(
-        data
-    )
-
-    print(
-        f"Gemini success: {model_name}"
-    )
-
-    return data
+    return final_text
 
 
 # ============================================================
-# IMAGE ANALYSIS
+# GEMINI ANALYSIS
 # ============================================================
 
-async def analyze_chart(
-    image_bytes
-):
+async def analyze_chart(image_bytes: bytes):
 
-    # لا نصغر الصورة.
-    # نستخدم الصورة كما وصلت من Telegram.
-    image = Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGB")
+    models_to_try = [
+        GEMINI_MODEL
+    ]
 
-    output = io.BytesIO()
+    # Fallback models only if primary fails temporarily.
+    fallback_models = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+    ]
 
-    # JPEG بجودة عالية للحفاظ على تفاصيل الشارت.
-    image.save(
-        output,
-        format="JPEG",
-        quality=95
-    )
+    for model in fallback_models:
 
-    image_part = types.Part.from_bytes(
-        data=output.getvalue(),
-        mime_type="image/jpeg"
-    )
-
-    models = []
-
-    if GEMINI_MODEL:
-        models.append(
-            GEMINI_MODEL
-        )
-
-    for model in FALLBACK_MODELS:
-
-        if model not in models:
-            models.append(model)
+        if model not in models_to_try:
+            models_to_try.append(model)
 
     last_error = None
 
-    for model in models:
+    for index, model in enumerate(models_to_try):
 
         try:
 
-            return generate_analysis(
-                model,
-                image_part
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=model,
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg"
+                    ),
+                    ANALYSIS_PROMPT,
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=550,
+                ),
             )
 
-        except Exception as error:
+            text = (response.text or "").strip()
 
-            last_error = error
+            if not text:
+                raise RuntimeError(
+                    "Gemini returned an empty response"
+                )
 
-            print(
-                f"Gemini error [{model}]: "
-                f"{error}"
+            signal = extract_signal(text)
+
+            confidence = extract_confidence(text)
+
+            entry_delay = extract_entry_delay(text)
+
+            if signal not in ("CALL", "PUT"):
+                raise RuntimeError(
+                    "Gemini did not return a valid CALL/PUT signal"
+                )
+
+            if confidence is None:
+                raise RuntimeError(
+                    "Gemini did not return a valid confidence"
+                )
+
+            if entry_delay is None:
+                raise RuntimeError(
+                    "Gemini did not return a valid entry delay"
+                )
+
+            analysis = clean_result(
+                text,
+                signal,
+                confidence,
+                entry_delay
             )
 
-            # لا ننتقل لنموذج آخر إلا
-            # في الأخطاء المؤقتة.
-            if is_temporary_error(
-                error
-            ):
-                continue
+            return {
+                "analysis": analysis,
+                "signal": signal,
+                "confidence": confidence,
+                "entry_delay": entry_delay,
+                "model": model,
+            }
 
-            raise
+        except Exception as e:
 
-    raise RuntimeError(
-        "All Gemini models failed:\n"
-        + str(last_error)
-    )
+            last_error = e
 
+            error_text = str(e).lower()
 
-# ============================================================
-# FORMAT RESULT
-# ============================================================
+            temporary_error = any(
+                code in error_text
+                for code in [
+                    "503",
+                    "429",
+                    "500",
+                    "502",
+                    "504",
+                    "unavailable",
+                    "overloaded",
+                    "high demand",
+                    "quota",
+                ]
+            )
 
-def format_result(data):
+            # Do not switch models for normal analysis/parsing errors.
+            if not temporary_error:
+                break
 
-    signal = data["signal"]
-    confidence = data["confidence"]
+            # Do not unnecessarily wait between models.
+            continue
 
-    if signal == "CALL":
-        emoji = "🟢"
-        direction_text = "CALL (UP)"
-    else:
-        emoji = "🔴"
-        direction_text = "PUT (DOWN)"
-
-    delay = data[
-        "entry_delay_minutes"
-    ]
-
-    entry_time = calculate_entry_time(
-        delay
-    )
-
-    result = (
-        f"🎯 الإشارة: {emoji} "
-        f"{direction_text} {confidence}%\n\n"
-
-        f"📊 نسبة الثقة: {confidence}%\n"
-        f"📊 الأصل: {data['asset']}\n"
-        f"📊 الإطار الزمني: "
-        f"{data['timeframe']}\n"
-        f"⏱️ وقت الدخول: {entry_time}\n"
-        f"⏳ الدخول بعد: {delay} دقيقة\n\n"
-
-        f"🧭 الاتجاه: "
-        f"{data['direction']}\n"
-        f"📈 الاتجاه القصير: "
-        f"{data['short_direction']}\n\n"
-
-        f"Market Structure\n"
-        f"{data['market_structure']}\n\n"
-
-        f"Momentum\n"
-        f"{data['momentum']}\n\n"
-
-        f"Price Action\n"
-        f"{data['price_action']}\n\n"
-
-        f"شمعة التأكيد\n"
-        f"{data['confirmation_candle']}\n\n"
-
-        f"السبب\n"
-        f"{data['reason']}"
-    )
-
-    return result
+    raise RuntimeError(str(last_error))
 
 
 # ============================================================
 # PHOTO HANDLER
 # ============================================================
 
-async def photo_handler(
+async def handle_photo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.effective_user:
+    if not is_owner(update):
+
+        await update.message.reply_text(
+            "⛔ هذا البوت خاص."
+        )
+
         return
 
-    if not update.message:
-        return
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-        return
-
-    if not update.message.photo:
-        return
-
-    processing = await update.message.reply_text(
-        "🔎 تحليل الشارت..."
+    status_message = await update.message.reply_text(
+        "🔎 جاري تحليل الشارت..."
     )
 
     try:
 
-        telegram_file = (
-            await update.message
-            .photo[-1]
-            .get_file()
+        photo = update.message.photo[-1]
+
+        telegram_file = await photo.get_file()
+
+        # Download the largest Telegram image directly.
+        # NO RESIZE.
+        # NO PIL conversion.
+        # NO quality reduction.
+        image_bytes = bytes(
+            await telegram_file.download_as_bytearray()
         )
 
-        image_bytes = (
-            await telegram_file
-            .download_as_bytearray()
+        result = await analyze_chart(image_bytes)
+
+        entry_delay = result["entry_delay"]
+
+        entry_time = calculate_entry_time(
+            entry_delay
         )
 
-        analysis = await analyze_chart(
-            bytes(image_bytes)
+        final_text = format_result(
+            result["analysis"],
+            result["signal"],
+            result["confidence"],
+            entry_time,
+            entry_delay
         )
 
-        final_result = format_result(
-            analysis
+        await status_message.edit_text(
+            final_text
         )
 
-        await processing.edit_text(
-            final_result
-        )
+    except Exception as e:
 
-    except Exception as error:
-
-        message = str(error)
-
-        if len(message) > 1500:
-            message = message[:1500]
-
-        await processing.edit_text(
+        await status_message.edit_text(
             "❌ حدث خطأ أثناء التحليل:\n\n"
-            + message
+            f"{str(e)}"
         )
 
 
 # ============================================================
-# WIN
+# /START
 # ============================================================
 
-async def win_command(
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.effective_user:
-        return
+    if not is_owner(update):
 
-    if not is_owner(
-        update.effective_user.id
-    ):
-        return
+        await update.message.reply_text(
+            "⛔ هذا البوت خاص."
+        )
 
-    stats["win"] += 1
-
-    total = (
-        stats["win"]
-        + stats["loss"]
-    )
-
-    win_rate = (
-        stats["win"] / total * 100
-        if total
-        else 0
-    )
-
-    await update.message.reply_text(
-        "✅ WIN\n\n"
-        f"🟢 WIN: {stats['win']}\n"
-        f"🔴 LOSS: {stats['loss']}\n"
-        f"📊 الصفقات: {total}\n"
-        f"📈 Win Rate: {win_rate:.1f}%"
-    )
-
-
-# ============================================================
-# LOSS
-# ============================================================
-
-async def loss_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.effective_user:
-        return
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-        return
-
-    stats["loss"] += 1
-
-    total = (
-        stats["win"]
-        + stats["loss"]
-    )
-
-    win_rate = (
-        stats["win"] / total * 100
-        if total
-        else 0
-    )
-
-    await update.message.reply_text(
-        "❌ LOSS\n\n"
-        f"🟢 WIN: {stats['win']}\n"
-        f"🔴 LOSS: {stats['loss']}\n"
-        f"📊 الصفقات: {total}\n"
-        f"📈 Win Rate: {win_rate:.1f}%"
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
-
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.effective_user:
-        return
-
-    if not is_owner(
-        update.effective_user.id
-    ):
-        return
-
-    total = (
-        stats["win"]
-        + stats["loss"]
-    )
-
-    win_rate = (
-        stats["win"] / total * 100
-        if total
-        else 0
-    )
-
-    await update.message.reply_text(
-        "📊 إحصائيات الصفقات\n\n"
-        f"🟢 WIN: {stats['win']}\n"
-        f"🔴 LOSS: {stats['loss']}\n"
-        f"📊 المجموع: {total}\n"
-        f"📈 Win Rate: {win_rate:.1f}%"
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.effective_user:
-        return
-
-    if not is_owner(
-        update.effective_user.id
-    ):
         return
 
     await update.message.reply_text(
-        "🤖 ZinoQuotexSignalAI جاهز.\n\n"
-        "📸 أرسل Screenshot للشارت."
+        "🤖 ZinoQuotexSignalAI\n\n"
+        "📸 أرسل Screenshot للشارت.\n"
+        "🎯 سأحدد CALL أو PUT.\n"
+        "⏱️ وسأحدد وقت الدخول المناسب حسب الشارت.\n\n"
+        "الأمر:\n"
+        "/help"
     )
 
 
 # ============================================================
-# HELP
+# /HELP
 # ============================================================
 
 async def help_command(
@@ -865,19 +737,126 @@ async def help_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.effective_user:
-        return
+    if not is_owner(update):
 
-    if not is_owner(
-        update.effective_user.id
-    ):
+        await update.message.reply_text(
+            "⛔ هذا البوت خاص."
+        )
+
         return
 
     await update.message.reply_text(
-        "📸 أرسل Screenshot للشارت للتحليل.\n\n"
-        "/win — تسجيل WIN\n"
-        "/loss — تسجيل LOSS\n"
-        "/stats — إحصائيات الصفقات"
+        "📖 طريقة الاستخدام:\n\n"
+        "1️⃣ افتح Quotex\n"
+        "2️⃣ خذ Screenshot للشارت\n"
+        "3️⃣ أرسل الصورة هنا\n\n"
+        "البوت يحلل:\n"
+        "• Market Structure\n"
+        "• Trend\n"
+        "• Support / Resistance\n"
+        "• Price Action\n"
+        "• Confirmation Candle\n"
+        "• RSI إذا كان ظاهرًا\n"
+        "• EMA 5/13 إذا كانت ظاهرة\n\n"
+        "⏱️ البوت لا يفترض M1.\n"
+        "يحدد الإطار من الشارت إذا كان ظاهرًا.\n\n"
+        "⏳ وقت الدخول يحدده حسب الحالة، "
+        "وليس دائمًا بعد دقيقة."
+    )
+
+
+# ============================================================
+# /WIN
+# ============================================================
+
+async def win_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global wins
+
+    if not is_owner(update):
+        return
+
+    wins += 1
+
+    total = wins + losses
+
+    percentage = (
+        wins / total * 100
+        if total > 0
+        else 0
+    )
+
+    await update.message.reply_text(
+        f"✅ WIN\n\n"
+        f"🏆 Wins: {wins}\n"
+        f"❌ Losses: {losses}\n"
+        f"📊 Total: {total}\n"
+        f"📈 Win Rate: {percentage:.1f}%"
+    )
+
+
+# ============================================================
+# /LOSS
+# ============================================================
+
+async def loss_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global losses
+
+    if not is_owner(update):
+        return
+
+    losses += 1
+
+    total = wins + losses
+
+    percentage = (
+        wins / total * 100
+        if total > 0
+        else 0
+    )
+
+    await update.message.reply_text(
+        f"❌ LOSS\n\n"
+        f"🏆 Wins: {wins}\n"
+        f"❌ Losses: {losses}\n"
+        f"📊 Total: {total}\n"
+        f"📈 Win Rate: {percentage:.1f}%"
+    )
+
+
+# ============================================================
+# /STATS
+# ============================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_owner(update):
+        return
+
+    total = wins + losses
+
+    percentage = (
+        wins / total * 100
+        if total > 0
+        else 0
+    )
+
+    await update.message.reply_text(
+        f"📊 إحصائيات ZinoQuotexSignalAI\n\n"
+        f"🏆 Wins: {wins}\n"
+        f"❌ Losses: {losses}\n"
+        f"📊 Total: {total}\n"
+        f"📈 Win Rate: {percentage:.1f}%"
     )
 
 
@@ -885,16 +864,14 @@ async def help_command(
 # RENDER HEALTH SERVER
 # ============================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
         self.send_response(200)
 
         self.send_header(
-            "Content-Type",
+            "Content-type",
             "text/plain"
         )
 
@@ -912,43 +889,21 @@ class HealthHandler(
         return
 
 
-def start_health_server():
+def run_health_server():
 
     port = int(
         os.environ.get(
             "PORT",
-            10000
+            "10000"
         )
     )
 
     server = HTTPServer(
-        (
-            "0.0.0.0",
-            port
-        ),
+        ("0.0.0.0", port),
         HealthHandler
     )
 
-    print(
-        f"Health server running on port {port}"
-    )
-
     server.serve_forever()
-
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update,
-    context
-):
-
-    print(
-        "ERROR:",
-        context.error
-    )
 
 
 # ============================================================
@@ -957,32 +912,17 @@ async def error_handler(
 
 def main():
 
-    print(
-        "=========================================="
-    )
-    print(
-        "ZinoQuotexSignalAI"
-    )
-    print(
-        "Fast Smart Chart Analysis"
-    )
-    print(
-        "=========================================="
-    )
-
-    print(
-        f"Primary Gemini: {GEMINI_MODEL}"
-    )
-
-    health_thread = threading.Thread(
-        target=start_health_server,
+    # Start Render health server
+    health_thread = Thread(
+        target=run_health_server,
         daemon=True
     )
 
     health_thread.start()
 
     application = (
-        Application.builder()
+        Application
+        .builder()
         .token(BOT_TOKEN)
         .build()
     )
@@ -990,7 +930,7 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start
+            start_command
         )
     )
 
@@ -1025,16 +965,12 @@ def main():
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            photo_handler
+            handle_photo
         )
     )
 
-    application.add_error_handler(
-        error_handler
-    )
-
     print(
-        "Bot is running..."
+        "ZinoQuotexSignalAI started successfully."
     )
 
     application.run_polling(
