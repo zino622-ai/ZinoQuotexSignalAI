@@ -27,10 +27,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_TEXT = os.getenv("OWNER_ID")
 
 # النموذج الأساسي السريع
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash-lite"
-)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
