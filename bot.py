@@ -7,7 +7,12 @@ from datetime import timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from google import genai
 from google.genai import types
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -18,16 +23,17 @@ from telegram.ext import (
 )
 
 
-# =========================
+# ============================================================
 # ENV
-# =========================
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_TEXT = os.getenv("OWNER_ID")
 
-# النموذج الأساسي السريع
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# النموذج الحالي
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -44,38 +50,38 @@ except ValueError:
     raise RuntimeError("OWNER_ID must be a number")
 
 
-# =========================
+# ============================================================
 # GEMINI CLIENT
-# =========================
+# ============================================================
 
 client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(
-        timeout=18000
+        timeout=15000
     )
 )
 
 
-# =========================
+# ============================================================
 # TIMEZONE UTC-3
-# =========================
+# ============================================================
 
 UTC_MINUS_3 = timezone(
     timedelta(hours=-3)
 )
 
 
-# =========================
+# ============================================================
 # STATS
-# =========================
+# ============================================================
 
 wins = 0
 losses = 0
 
 
-# =========================
+# ============================================================
 # PROMPT
-# =========================
+# ============================================================
 
 PROMPT = """
 أنت محلل فني لشارت Quotex.
@@ -153,9 +159,9 @@ Bollinger Bands
 """
 
 
-# =========================
+# ============================================================
 # JSON SCHEMA
-# =========================
+# ============================================================
 
 SCHEMA = {
     "type": "OBJECT",
@@ -227,19 +233,23 @@ SCHEMA = {
 }
 
 
-# =========================
+# ============================================================
 # HEALTH SERVER
-# =========================
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8"
         )
+
         self.end_headers()
+
         self.wfile.write(
             b"ZinoQuotexSignalAI is running"
         )
@@ -271,9 +281,9 @@ threading.Thread(
 ).start()
 
 
-# =========================
+# ============================================================
 # OWNER CHECK
-# =========================
+# ============================================================
 
 def is_owner(update: Update):
 
@@ -285,14 +295,11 @@ def is_owner(update: Update):
     return user.id == OWNER_ID
 
 
-# =========================
+# ============================================================
 # GEMINI REQUEST
-# =========================
+# ============================================================
 
-def gemini_request(
-    image_bytes,
-    model_name
-):
+def gemini_request(image_bytes):
 
     image_part = types.Part.from_bytes(
         data=image_bytes,
@@ -300,7 +307,7 @@ def gemini_request(
     )
 
     response = client.models.generate_content(
-        model=model_name,
+        model=GEMINI_MODEL,
         contents=[
             PROMPT,
             image_part
@@ -316,94 +323,92 @@ def gemini_request(
     return response.text
 
 
-# =========================
+# ============================================================
 # ANALYZE IMAGE
-# =========================
+# ============================================================
 
 async def analyze_image(image_bytes):
 
-    models_to_try = [
-        GEMINI_MODEL
-    ]
-
-    # احتياط إذا كان الموديل الأساسي مزدحماً
-    if GEMINI_MODEL != "gemini-2.5-flash-lite":
-        models_to_try.append(
-            "gemini-2.5-flash-lite"
-        )
-
     last_error = None
 
-    for model_name in models_to_try:
+    # ========================================================
+    # IMPORTANT:
+    # لا يوجد أي fallback إلى Gemini 2.5
+    # ========================================================
 
-        for attempt in range(2):
+    for attempt in range(2):
 
-            try:
+        try:
 
-                raw = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        gemini_request,
-                        image_bytes,
-                        model_name
-                    ),
-                    timeout=22
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(
+                    gemini_request,
+                    image_bytes
+                ),
+                timeout=18
+            )
+
+            if not raw:
+
+                raise ValueError(
+                    "Gemini returned an empty response"
                 )
 
-                if not raw:
-                    raise ValueError(
-                        "Gemini returned an empty response"
-                    )
+            raw = raw.strip()
+
+            if raw.startswith("```"):
+
+                raw = raw.replace(
+                    "```json",
+                    ""
+                )
+
+                raw = raw.replace(
+                    "```",
+                    ""
+                )
 
                 raw = raw.strip()
 
-                if raw.startswith("```"):
-                    raw = raw.replace(
-                        "```json",
-                        ""
-                    )
-                    raw = raw.replace(
-                        "```",
-                        ""
-                    )
-                    raw = raw.strip()
+            try:
 
-                try:
-                    return json.loads(raw)
+                return json.loads(raw)
 
-                except json.JSONDecodeError:
-                    raise ValueError(
-                        "Gemini returned invalid JSON"
-                    )
+            except json.JSONDecodeError:
 
-            except asyncio.TimeoutError:
-
-                last_error = (
-                    f"⏱ انتهت مهلة التحليل "
-                    f"بعد 22 ثانية "
-                    f"({model_name})"
+                raise ValueError(
+                    "Gemini returned invalid JSON"
                 )
 
-            except Exception as e:
+        except asyncio.TimeoutError:
 
-                last_error = str(e)
+            last_error = (
+                "⏱ انتهت مهلة التحليل بعد 18 ثانية."
+            )
 
-                error_lower = last_error.lower()
+        except Exception as e:
 
-                is_busy = (
-                    "503" in error_lower
-                    or
-                    "unavailable" in error_lower
-                    or
-                    "high demand" in error_lower
-                    or
-                    "429" in error_lower
-                )
+            last_error = str(e)
 
-                if is_busy and attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
+            error_lower = last_error.lower()
 
-                break
+            is_busy = (
+                "503" in error_lower
+                or
+                "unavailable" in error_lower
+                or
+                "high demand" in error_lower
+                or
+                "429" in error_lower
+            )
+
+            if is_busy and attempt == 0:
+
+                await asyncio.sleep(0.7)
+
+                continue
+
+            break
 
     raise ValueError(
         last_error or
@@ -411,9 +416,9 @@ async def analyze_image(image_bytes):
     )
 
 
-# =========================
+# ============================================================
 # FORMAT SIGNAL
-# =========================
+# ============================================================
 
 def format_signal(data):
 
@@ -425,9 +430,17 @@ def format_signal(data):
     ).upper()
 
     if decision == "DOWN":
-        direction = "🔴 DOWN — بيع (Put)"
+
+        direction = (
+            "🔴 DOWN — بيع (Put)"
+        )
+
     else:
-        direction = "🟢 UP — شراء (Call)"
+
+        direction = (
+            "🟢 UP — شراء (Call)"
+        )
+
 
     confidence = data.get(
         "confidence",
@@ -499,33 +512,53 @@ def format_signal(data):
         "غير واضح"
     )
 
+
     return (
         "🎓 تحليل زينو\n\n"
+
         f"✅ Solid Setup · {confidence}%\n"
+
         f"📊 {asset} · ⏱ {timeframe}\n"
+
         "━━━━━━━━━━━━━━\n\n"
+
         f"🎯 القرار: {direction}\n"
+
         f"🕐 وقت الشارت: {chart_time}\n"
+
         f"⏰ وقت الدخول: {entry_time}\n"
+
         f"💵 سعر الدخول: {entry_price}\n"
+
         "━━━━━━━━━━━━━━\n\n"
+
         f"📐 الاتجاه: {trend}\n"
+
         f"📈 الاتجاه القصير: {short_trend}\n"
+
         f"🏗 البنية السعرية: {structure}\n"
+
         f"〽️ Keltner 20/10: {keltner}\n"
+
         f"📊 ADX 14/14: {adx}\n"
+
         f"🕯 شمعة التأكيد: {candle}\n"
+
         "━━━━━━━━━━━━━━\n\n"
+
         f"🧠 شرح زينو: {reason}\n\n"
+
         f"🛑 شرط إلغاء الإشارة: {cancellation}\n"
+
         "━━━━━━━━━━━━━━\n\n"
+
         "⚠️ التحليل مبني على الشارت المرسل."
     )
 
 
-# =========================
+# ============================================================
 # START
-# =========================
+# ============================================================
 
 async def start(
     update: Update,
@@ -541,9 +574,9 @@ async def start(
     )
 
 
-# =========================
+# ============================================================
 # STATS
-# =========================
+# ============================================================
 
 async def stats(
     update: Update,
@@ -556,24 +589,32 @@ async def stats(
     total = wins + losses
 
     if total:
+
         winrate = (
             wins / total
         ) * 100
+
     else:
+
         winrate = 0
+
 
     await update.message.reply_text(
         "📊 إحصائيات التداول\n\n"
+
         f"✅ WIN: {wins}\n"
+
         f"❌ LOSS: {losses}\n"
+
         f"📌 TOTAL: {total}\n"
+
         f"🎯 WIN RATE: {winrate:.1f}%"
     )
 
 
-# =========================
+# ============================================================
 # RESET
-# =========================
+# ============================================================
 
 async def reset_stats(
     update: Update,
@@ -594,9 +635,9 @@ async def reset_stats(
     )
 
 
-# =========================
+# ============================================================
 # PHOTO
-# =========================
+# ============================================================
 
 async def photo_handler(
     update: Update,
@@ -612,12 +653,15 @@ async def photo_handler(
     if not update.message.photo:
         return
 
+
     status = await update.message.reply_text(
         "🔎 جاري تحليل الشارت..."
     )
 
+
     try:
 
+        # نأخذ أعلى جودة للصورة المرسلة
         photo = update.message.photo[-1]
 
         telegram_file = await photo.get_file()
@@ -630,18 +674,23 @@ async def photo_handler(
 
         image_bytes = image_buffer.getvalue()
 
+
         if not image_bytes:
+
             raise ValueError(
                 "الصورة فارغة"
             )
+
 
         data = await analyze_image(
             image_bytes
         )
 
+
         signal = format_signal(
             data
         )
+
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -650,6 +699,7 @@ async def photo_handler(
                         "✅ WIN",
                         callback_data="trade_win"
                     ),
+
                     InlineKeyboardButton(
                         "❌ LOSS",
                         callback_data="trade_loss"
@@ -658,17 +708,21 @@ async def photo_handler(
             ]
         )
 
+
         await status.edit_text(
             signal,
             reply_markup=keyboard
         )
+
 
     except Exception as e:
 
         error_text = str(e)
 
         if len(error_text) > 1200:
+
             error_text = error_text[:1200]
+
 
         await status.edit_text(
             "❌ فشل التحليل بسرعة بدل الانتظار الطويل.\n\n"
@@ -676,9 +730,9 @@ async def photo_handler(
         )
 
 
-# =========================
+# ============================================================
 # BUTTONS
-# =========================
+# ============================================================
 
 async def button_handler(
     update: Update,
@@ -693,11 +747,16 @@ async def button_handler(
     if not query:
         return
 
+
     if query.from_user.id != OWNER_ID:
+
         await query.answer()
+
         return
 
+
     await query.answer()
+
 
     if query.data == "trade_win":
 
@@ -705,10 +764,14 @@ async def button_handler(
 
         await query.message.reply_text(
             "✅ تم تسجيل WIN\n\n"
+
             f"WIN: {wins}\n"
+
             f"LOSS: {losses}\n"
+
             f"TOTAL: {wins + losses}"
         )
+
 
     elif query.data == "trade_loss":
 
@@ -716,15 +779,18 @@ async def button_handler(
 
         await query.message.reply_text(
             "❌ تم تسجيل LOSS\n\n"
+
             f"WIN: {wins}\n"
+
             f"LOSS: {losses}\n"
+
             f"TOTAL: {wins + losses}"
         )
 
 
-# =========================
+# ============================================================
 # ERROR
-# =========================
+# ============================================================
 
 async def error_handler(
     update,
@@ -737,9 +803,9 @@ async def error_handler(
     )
 
 
-# =========================
+# ============================================================
 # MAIN
-# =========================
+# ============================================================
 
 def main():
 
@@ -749,12 +815,14 @@ def main():
         .build()
     )
 
+
     application.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
+
 
     application.add_handler(
         CommandHandler(
@@ -763,12 +831,14 @@ def main():
         )
     )
 
+
     application.add_handler(
         CommandHandler(
             "resetstats",
             reset_stats
         )
     )
+
 
     application.add_handler(
         MessageHandler(
@@ -777,24 +847,37 @@ def main():
         )
     )
 
+
     application.add_handler(
         CallbackQueryHandler(
             button_handler
         )
     )
 
+
     application.add_error_handler(
         error_handler
     )
+
 
     print(
         "ZinoQuotexSignalAI started."
     )
 
+    print(
+        "Gemini model:",
+        GEMINI_MODEL
+    )
+
+
     application.run_polling(
         drop_pending_updates=True
     )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
