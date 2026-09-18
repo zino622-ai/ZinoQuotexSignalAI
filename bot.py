@@ -7,18 +7,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from google import genai
 from google.genai import types
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-ApplicationBuilder,
-CommandHandler,
-MessageHandler,
-CallbackQueryHandler,
-ContextTypes,
-filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_ID = os.getenv("OWNER_ID")
+OWNER_ID_TEXT = os.getenv("OWNER_ID")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 if not BOT_TOKEN:
@@ -27,25 +20,29 @@ raise RuntimeError("BOT_TOKEN is missing")
 if not GEMINI_API_KEY:
 raise RuntimeError("GEMINI_API_KEY is missing")
 
-if not OWNER_ID:
+if not OWNER_ID_TEXT:
 raise RuntimeError("OWNER_ID is missing")
 
-OWNER_ID = int(OWNER_ID)
+try:
+OWNER_ID = int(OWNER_ID_TEXT)
+except ValueError:
+raise RuntimeError("OWNER_ID must be a number")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 stats = {
 "total": 0,
 "wins": 0,
-"losses": 0,
+"losses": 0
 }
 
 class HealthHandler(BaseHTTPRequestHandler):
+
 def do_GET(self):
-self.send_response(200)
-self.send_header("Content-Type", "text/plain")
-self.end_headers()
-self.wfile.write(b"ZinoQuotexSignalAI is running")
+    self.send_response(200)
+    self.send_header("Content-Type", "text/plain")
+    self.end_headers()
+    self.wfile.write(b"ZinoQuotexSignalAI is running")
 
 def log_message(self, format, *args):
     pass
@@ -64,100 +61,113 @@ PROMPT = """
 أنت Zino، محلل شارت Quotex.
 
 حلل صورة الشارت وأعطِ إشارة واحدة فقط:
-UP (CALL)
-أو
-DOWN (PUT)
 
-اعتمد على المؤشرين التاليين فقط:
+UP = CALL
+DOWN = PUT
 
-1. Keltner Channel 20/10
-2. ADX 14/14
+اعتمد على المؤشرين فقط:
+
+Keltner Channel 20/10
+ADX 14/14
 
 لا تستخدم أي مؤشر آخر.
 
-لا تستخدم:
-RSI
-MACD
-Moving Average
-Parabolic SAR
-Stochastic
-Bollinger Bands
-أو أي مؤشر إضافي.
+لا تستخدم RSI.
+لا تستخدم MACD.
+لا تستخدم Moving Average.
+لا تستخدم Parabolic SAR.
+لا تستخدم Stochastic.
+لا تستخدم Bollinger Bands.
+لا تستخدم أي مؤشر إضافي.
 
-حلل أيضاً حركة السعر والشموع الظاهرة في الشارت، لأن هذه ليست مؤشرات إضافية.
+حلل حركة السعر والشموع الظاهرة في الصورة مع المؤشرين الأساسيين.
 
 ركز على:
 
-- اتجاه السعر.
-- القمم والقيعان.
-- إغلاق الشموع.
-- افتتاح الشموع.
-- قوة جسم الشمعة.
-- الذيول.
-- الاختراقات.
-- تأكيد الاختراق.
-- الزخم.
-- الشمعة الحالية.
-- الشمعة السابقة.
-- توافق السعر مع Keltner.
-- قوة الاتجاه مع ADX.
-- +DI و -DI الظاهرين مع ADX.
+اتجاه السعر.
+القمم والقيعان.
+Higher High و Higher Low.
+Lower High و Lower Low.
+افتتاح الشموع.
+إغلاق الشموع.
+قوة جسم الشمعة.
+الذيول.
+الاختراقات.
+إغلاق الاختراق.
+الزخم.
+الشمعة الحالية.
+الشمعة السابقة.
 
 Keltner Channel 20/10:
-استخدمه لتحديد اتجاه الحركة ومكان السعر داخل القناة والاختراقات.
+
+استخدم Keltner لتحديد اتجاه الحركة، ميل القناة، مكان السعر داخل القناة، والاختراقات.
 
 ADX 14/14:
-استخدمه لمعرفة قوة الاتجاه وقراءة +DI و -DI لتحديد الطرف المسيطر.
 
-لا تجعل ADX وحده يحدد الاتجاه.
+استخدم ADX لمعرفة قوة الاتجاه.
+اقرأ +DI و -DI لمعرفة الطرف المسيطر.
+ADX وحده لا يحدد الاتجاه.
 
-UP عندما تكون الأدلة الصاعدة متوافقة.
-DOWN عندما تكون الأدلة الهابطة متوافقة.
+UP عندما تكون حركة السعر وKeltner وADX وDI متوافقة في الاتجاه الصاعد.
 
-لا تعطِ UP دائماً.
-لا تعطِ DOWN دائماً.
+DOWN عندما تكون حركة السعر وKeltner وADX وDI متوافقة في الاتجاه الهابط.
 
-إذا كان هناك اختراق، لا تعتبر مجرد ذيل اختراقاً مؤكداً.
-أعطِ أهمية لإغلاق الشمعة وتوافق الزخم وKeltner وADX.
+لا تجعل كل الإشارات UP.
+لا تجعل كل الإشارات DOWN.
+
+إذا كان الاختراق مجرد ذيل فلا تعتبره اختراقاً مؤكداً.
+أعط أهمية لإغلاق الشمعة.
 
 وقت الدخول:
+
 الدخول يكون في بداية الشمعة القادمة مباشرة.
 
-إذا كان الشارت M1، وقت الدخول هو بداية الدقيقة التالية.
+إذا كان M1:
+الدخول في بداية الدقيقة التالية.
 
-إذا كان الشارت M2، وقت الدخول هو بداية الشمعة التالية ذات الدقيقتين.
-
-لا تعطِ وقت دخول بعيداً عن الشمعة القادمة.
+إذا كان M2:
+الدخول في بداية الشمعة التالية ذات الدقيقتين.
 
 اعتمد وقت الشارت الظاهر في الصورة.
+
 منطقة وقت Quotex هي UTC-3.
 
 أعطني وقت الدخول فقط.
+
 لا تعطِ وقت انتهاء.
 
 سعر الدخول:
 استخدم السعر الظاهر في الشارت إذا كان واضحاً.
 
 شرط إلغاء الإشارة:
-حدد شرطاً واضحاً مبنياً على السعر والبنية الحالية.
+يجب أن يكون مرتبطاً بالبنية السعرية الحالية.
+
+UP:
+تلغى الإشارة إذا أغلقت الشمعة الحالية تحت مستوى إبطال الاتجاه الصاعد قبل الدخول.
+
+DOWN:
+تلغى الإشارة إذا أغلقت الشمعة الحالية فوق مستوى إبطال الاتجاه الهابط قبل الدخول.
+
 لا تخترع مستوى عشوائياً.
 
-مثال UP:
-إذا أغلقت الشمعة الحالية تحت المستوى الذي يؤكد بقاء الاتجاه الصاعد قبل الدخول، تلغى الإشارة.
+نسبة الثقة تعتمد على توافق:
 
-مثال DOWN:
-إذا أغلقت الشمعة الحالية فوق المستوى الذي يؤكد بقاء الاتجاه الهابط قبل الدخول، تلغى الإشارة.
+حركة السعر
+Keltner 20/10
+ADX 14/14
++DI / -DI
+الشموع
+الزخم
 
-نسبة الثقة:
-احسبها من توافق Keltner + ADX + حركة السعر + الشموع.
 لا تضع نسبة عشوائية.
 
 أخرج JSON فقط.
-لا تكتب Markdown.
-لا تستخدم ```json.
-لا تضف أي كلام خارج JSON.
 
-يجب أن يحتوي JSON على:
+لا تستخدم Markdown.
+لا تستخدم ```json.
+لا تكتب أي كلام خارج JSON.
+
+JSON يجب أن يحتوي فقط على:
 
 direction
 confidence
@@ -174,14 +184,13 @@ candle
 momentum
 reason
 
-direction يجب أن يكون:
-UP
-أو
-DOWN
+direction:
+UP أو DOWN
 
-confidence رقم من 0 إلى 100.
+confidence:
+رقم من 0 إلى 100.
 
-لا تضف أي حقول أخرى.
+لا تضف حقولاً أخرى.
 """
 
 SCHEMA = {
@@ -250,9 +259,10 @@ SCHEMA = {
 }
 
 def analyze_image(image_bytes, mime_type):
+
 image = types.Part.from_bytes(
-data=image_bytes,
-mime_type=mime_type
+    data=image_bytes,
+    mime_type=mime_type
 )
 
 response = client.models.generate_content(
@@ -278,8 +288,16 @@ except json.JSONDecodeError:
     raise ValueError("Gemini returned invalid JSON")
 
 def format_signal(data):
+
 direction = data["direction"]
-confidence = max(0, min(100, int(data["confidence"])))
+
+confidence = int(data["confidence"])
+
+if confidence < 0:
+    confidence = 0
+
+if confidence > 100:
+    confidence = 100
 
 if direction == "UP":
     decision = "🟢 UP — شراء (Call)"
@@ -287,44 +305,46 @@ else:
     decision = "🔴 DOWN — بيع (Put)"
 
 return (
-    f"🎓 تحليل زينو\n"
-    f"✅ Solid Setup · {confidence}%\n"
-    f"📊 {data['asset']} · ⏱ {data['timeframe']}\n"
-    f"━━━━━━━━━━━━━━━\n"
-    f"🎯 القرار: {decision}\n"
-    f"🕐 وقت الشارت: {data['chart_time']}\n"
-    f"⏰ وقت الدخول: {data['entry_time']}\n"
-    f"⏳ مدة الصفقة: {data['timeframe']}\n"
-    f"💵 سعر الدخول: {data['entry_price']}\n"
-    f"🛑 شرط إلغاء الإشارة: {data['cancellation_condition']}\n"
-    f"━━━━━━━━━━━━━━━\n"
-    f"📐 الاتجاه: {data['trend']}\n"
-    f"📊 Keltner 20/10: {data['keltner']}\n"
-    f"📊 ADX 14/14: {data['adx']}\n"
-    f"🕯 النموذج: {data['candle']}\n"
-    f"📈 الزخم: {data['momentum']}\n"
-    f"━━━━━━━━━━━━━━━\n"
-    f"🧠 شرح زينو:\n"
-    f"{data['reason']}"
+    "🎓 تحليل زينو\n"
+    "✅ Solid Setup · " + str(confidence) + "%\n"
+    "📊 " + data["asset"] + " · ⏱ " + data["timeframe"] + "\n"
+    "━━━━━━━━━━━━━━━\n"
+    "🎯 القرار: " + decision + "\n"
+    "🕐 وقت الشارت: " + data["chart_time"] + "\n"
+    "⏰ وقت الدخول: " + data["entry_time"] + "\n"
+    "⏳ مدة الصفقة: " + data["timeframe"] + "\n"
+    "💵 سعر الدخول: " + data["entry_price"] + "\n"
+    "🛑 شرط إلغاء الإشارة: " + data["cancellation_condition"] + "\n"
+    "━━━━━━━━━━━━━━━\n"
+    "📐 الاتجاه: " + data["trend"] + "\n"
+    "📊 Keltner 20/10: " + data["keltner"] + "\n"
+    "📊 ADX 14/14: " + data["adx"] + "\n"
+    "🕯 النموذج: " + data["candle"] + "\n"
+    "📈 الزخم: " + data["momentum"] + "\n"
+    "━━━━━━━━━━━━━━━\n"
+    "🧠 شرح زينو:\n"
+    + data["reason"]
 )
 
 def result_buttons():
+
 return InlineKeyboardMarkup([
-[
-InlineKeyboardButton(
-"✅ WIN",
-callback_data="win"
-),
-InlineKeyboardButton(
-"❌ LOSS",
-callback_data="loss"
-)
-]
+    [
+        InlineKeyboardButton(
+            "✅ WIN",
+            callback_data="win"
+        ),
+        InlineKeyboardButton(
+            "❌ LOSS",
+            callback_data="loss"
+        )
+    ]
 ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
 if update.effective_user.id != OWNER_ID:
-return
+    return
 
 await update.message.reply_text(
     "Zino جاهز.\n\n"
@@ -334,29 +354,45 @@ await update.message.reply_text(
 )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
 if update.effective_user.id != OWNER_ID:
-return
+    return
 
 total = stats["total"]
 wins = stats["wins"]
 losses = stats["losses"]
 
-winrate = (wins / total * 100) if total else 0
+if total:
+    winrate = wins / total * 100
+else:
+    winrate = 0
 
 await update.message.reply_text(
-    f"📊 إحصائيات زينو\n"
-    f"الصفقات: {total}\n"
-    f"WIN: {wins}\n"
-    f"LOSS: {losses}\n"
-    f"Win Rate: {winrate:.1f}%"
+    "📊 إحصائيات زينو\n"
+    "━━━━━━━━━━━━━━━\n"
+    "الصفقات: " + str(total) + "\n"
+    "WIN: " + str(wins) + "\n"
+    "LOSS: " + str(losses) + "\n"
+    "Win Rate: " + f"{winrate:.1f}%"
 )
 
-async def photo_handler(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE
-):
+async def reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
 if update.effective_user.id != OWNER_ID:
-return
+    return
+
+stats["total"] = 0
+stats["wins"] = 0
+stats["losses"] = 0
+
+await update.message.reply_text(
+    "تم تصفير الإحصائيات."
+)
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+if update.effective_user.id != OWNER_ID:
+    return
 
 message = update.message
 
@@ -365,14 +401,14 @@ status = await message.reply_text(
 )
 
 try:
+
     photo = message.photo[-1]
+
     telegram_file = await photo.get_file()
 
     buffer = io.BytesIO()
 
-    await telegram_file.download_to_memory(
-        buffer
-    )
+    await telegram_file.download_to_memory(buffer)
 
     image_bytes = buffer.getvalue()
 
@@ -383,6 +419,7 @@ try:
 
     if image_bytes.startswith(b"\x89PNG"):
         mime_type = "image/png"
+
     elif image_bytes.startswith(b"RIFF"):
         mime_type = "image/webp"
 
@@ -400,20 +437,18 @@ try:
     )
 
 except Exception as e:
+
     error = str(e)
 
     if len(error) > 700:
         error = error[:700]
 
     await status.edit_text(
-        "❌ حدث خطأ أثناء التحليل:\n\n"
-        + error
+        "❌ حدث خطأ أثناء التحليل:\n\n" + error
     )
 
-async def result_handler(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE
-):
+async def result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
 query = update.callback_query
 
 if query.from_user.id != OWNER_ID:
@@ -423,13 +458,17 @@ if query.from_user.id != OWNER_ID:
 await query.answer()
 
 if query.data == "win":
+
     stats["wins"] += 1
     stats["total"] += 1
+
     message = "✅ تم تسجيل WIN"
 
 elif query.data == "loss":
+
     stats["losses"] += 1
     stats["total"] += 1
+
     message = "❌ تم تسجيل LOSS"
 
 else:
@@ -439,46 +478,36 @@ total = stats["total"]
 wins = stats["wins"]
 losses = stats["losses"]
 
-winrate = wins / total * 100 if total else 0
+if total:
+    winrate = wins / total * 100
+else:
+    winrate = 0
 
 await query.edit_message_reply_markup(
     reply_markup=None
 )
 
 await query.message.reply_text(
-    f"{message}\n\n"
-    f"📊 الصفقات: {total}\n"
-    f"✅ WIN: {wins}\n"
-    f"❌ LOSS: {losses}\n"
-    f"🎯 Win Rate: {winrate:.1f}%"
+    message + "\n\n"
+    "📊 الصفقات: " + str(total) + "\n"
+    "✅ WIN: " + str(wins) + "\n"
+    "❌ LOSS: " + str(losses) + "\n"
+    "🎯 Win Rate: " + f"{winrate:.1f}%"
 )
 
-async def reset_stats(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE
-):
-if update.effective_user.id != OWNER_ID:
-return
+async def error_handler(update, context):
 
-stats["total"] = 0
-stats["wins"] = 0
-stats["losses"] = 0
-
-await update.message.reply_text(
-    "تم تصفير الإحصائيات."
+print(
+    "Telegram error:",
+    context.error
 )
-
-async def error_handler(
-update: object,
-context: ContextTypes.DEFAULT_TYPE
-):
-print("Telegram error:", context.error)
 
 def main():
+
 print("ZinoQuotexSignalAI starting...")
 print("Keltner Channel 20/10")
 print("ADX 14/14")
-print(f"Gemini model: {GEMINI_MODEL}")
+print("Gemini model:", GEMINI_MODEL)
 
 app = (
     ApplicationBuilder()
