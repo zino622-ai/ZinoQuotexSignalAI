@@ -24,15 +24,18 @@ from telegram.ext import (
 
 
 # ============================================================
-# ENV
+# SETTINGS
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_TEXT = os.getenv("OWNER_ID")
 
-# النموذج الحالي
+# لا نستخدم أي موديل قديم
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# توقيت Quotex
+UTC_MINUS_3 = timezone(timedelta(hours=-3))
 
 
 if not BOT_TOKEN:
@@ -51,7 +54,7 @@ except ValueError:
 
 
 # ============================================================
-# GEMINI CLIENT
+# GEMINI
 # ============================================================
 
 client = genai.Client(
@@ -59,15 +62,6 @@ client = genai.Client(
     http_options=types.HttpOptions(
         timeout=15000
     )
-)
-
-
-# ============================================================
-# TIMEZONE UTC-3
-# ============================================================
-
-UTC_MINUS_3 = timezone(
-    timedelta(hours=-3)
 )
 
 
@@ -80,78 +74,102 @@ losses = 0
 
 
 # ============================================================
-# PROMPT
+# ANALYSIS PROMPT
 # ============================================================
 
 PROMPT = """
-أنت محلل فني لشارت Quotex.
+أنت محلل فني سريع لشارت Quotex.
 
-حلل الصورة المرسلة فقط.
-ممنوع اختراع أي سعر أو وقت أو مؤشر غير ظاهر.
+مهمتك تحليل الصورة المرسلة فقط وإعطاء اتجاه واحد:
+UP أو DOWN.
 
-الاستراتيجية الوحيدة:
+لا تخترع أي معلومة غير ظاهرة في الصورة.
 
-1. Keltner Channel 20/10
-- اتجاه القناة وميلها.
-- مكان السعر داخل القناة.
-- الاختراقات الواضحة.
-- لمس الحد وحده ليس إشارة انعكاس.
+التحليل يعتمد فقط على:
 
-2. ADX 14/14
-- قوة الاتجاه.
-- +DI و -DI إذا كانت ظاهرة.
-- ADX وحده لا يحدد الاتجاه.
-
-3. Price Action
+1. Price Action
 - فتح وإغلاق الشموع.
+- أجسام الشموع.
+- الظلال.
 - القمم والقيعان.
 - Higher High / Higher Low.
 - Lower High / Lower Low.
-- جسم الشمعة والظلال.
-- الاختراق والإغلاق فوق أو تحت المستوى.
+- كسر المستويات.
+- إغلاق الشمعة بعد الكسر.
 - شمعة التأكيد.
+
+2. Keltner Channel 20/10
+- اتجاه القناة.
+- ميل القناة.
+- مكان السعر داخل القناة.
+- الاختراق الواضح.
+- لا تعتبر مجرد ملامسة الحد إشارة انعكاس.
+
+3. ADX 14/14
+- قوة الاتجاه.
+- +DI و -DI إذا كانا ظاهرين.
+- ADX وحده لا يحدد الاتجاه.
 
 ممنوع استخدام:
 RSI
 MACD
-Moving Average
 EMA
 SMA
+Moving Average
 Parabolic SAR
 Stochastic
 Bollinger Bands
 أي مؤشر آخر.
 
-قرار UP:
-هيكل صاعد + حركة سعر صاعدة + Keltner داعم + ADX/+DI داعم عندما تكون البيانات ظاهرة.
+قواعد القرار:
 
-قرار DOWN:
-هيكل هابط + حركة سعر هابطة + Keltner داعم + ADX/-DI داعم عندما تكون البيانات ظاهرة.
+UP:
+إذا كان الهيكل السعري صاعدًا،
+والقمم والقيعان تدعم الصعود،
+والشموع تدعم الصعود،
+والـ Keltner داعم،
+وADX/+DI داعم عندما يكون ظاهرًا.
+
+DOWN:
+إذا كان الهيكل السعري هابطًا،
+والقمم والقيعان تدعم الهبوط،
+والشموع تدعم الهبوط،
+والـ Keltner داعم،
+وADX/-DI داعم عندما يكون ظاهرًا.
 
 لا تجعل كل الإشارات UP.
 لا تجعل كل الإشارات DOWN.
 
-الاختراق لا يعتبر مؤكداً بالظل فقط.
-الإغلاق هو المهم.
+الظل وحده لا يعتبر اختراقًا مؤكدًا.
+الإغلاق أهم من مجرد اللمس أو الظل.
 
 وقت الدخول:
-المستخدم يعمل UTC-3.
+المستخدم يعمل بتوقيت UTC-3.
 الدخول يكون في بداية الشمعة القادمة.
 استخدم وقت الشارت الظاهر في الصورة.
-لا تعط وقت انتهاء.
-لا تقل "بعد ساعة" أو "بعد عدة دقائق".
 أعط وقت الدخول فقط.
+لا تعط وقت انتهاء.
+لا تقل "بعد ساعة".
+لا تقل "بعد عدة دقائق".
 
 إذا كان وقت الشارت غير واضح:
-ضع "غير واضح" بدل اختراع وقت.
+entry_time = "غير واضح"
+
+إذا كان السعر غير واضح:
+entry_price = "غير واضح"
 
 شرط الإلغاء:
-استخدم مستوى واضح من الصورة.
-لا تخترع مستوى.
+استخدم مستوى واضحًا ظاهرًا في الصورة.
+إذا لم يوجد مستوى واضح:
+cancellation = "غير واضح"
 
 الثقة:
-اجعل النسبة حسب قوة توافق الأدلة الظاهرة.
-لا ترفع الثقة بشكل عشوائي.
+ضع نسبة واقعية حسب توافق الأدلة الظاهرة.
+لا تعط 90% أو 100% إلا إذا كانت الأدلة قوية جدًا.
+
+الأصل والزمن:
+اقرأهما من الصورة.
+لا تخترعهما.
 
 أرجع JSON فقط.
 بدون Markdown.
@@ -166,53 +184,69 @@ Bollinger Bands
 SCHEMA = {
     "type": "OBJECT",
     "properties": {
+
         "decision": {
             "type": "STRING",
             "enum": ["UP", "DOWN"]
         },
+
         "confidence": {
             "type": "INTEGER"
         },
+
         "asset": {
             "type": "STRING"
         },
+
         "timeframe": {
             "type": "STRING"
         },
+
         "chart_time": {
             "type": "STRING"
         },
+
         "entry_time": {
             "type": "STRING"
         },
+
         "entry_price": {
             "type": "STRING"
         },
+
         "trend": {
             "type": "STRING"
         },
+
         "short_trend": {
             "type": "STRING"
         },
+
         "structure": {
             "type": "STRING"
         },
+
         "keltner": {
             "type": "STRING"
         },
+
         "adx": {
             "type": "STRING"
         },
+
         "candle": {
             "type": "STRING"
         },
+
         "reason": {
             "type": "STRING"
         },
+
         "cancellation": {
             "type": "STRING"
         }
     },
+
     "required": [
         "decision",
         "confidence",
@@ -282,7 +316,7 @@ threading.Thread(
 
 
 # ============================================================
-# OWNER CHECK
+# OWNER
 # ============================================================
 
 def is_owner(update: Update):
@@ -307,16 +341,23 @@ def gemini_request(image_bytes):
     )
 
     response = client.models.generate_content(
+
         model=GEMINI_MODEL,
+
         contents=[
             PROMPT,
             image_part
         ],
+
         config=types.GenerateContentConfig(
+
             response_mime_type="application/json",
+
             response_schema=SCHEMA,
+
             temperature=0.1,
-            max_output_tokens=700
+
+            max_output_tokens=500
         )
     )
 
@@ -324,100 +365,94 @@ def gemini_request(image_bytes):
 
 
 # ============================================================
-# ANALYZE IMAGE
+# ANALYZE
 # ============================================================
 
 async def analyze_image(image_bytes):
 
-    last_error = None
+    try:
 
-    # ========================================================
-    # IMPORTANT:
-    # لا يوجد أي fallback إلى Gemini 2.5
-    # ========================================================
+        result = await asyncio.wait_for(
 
-    for attempt in range(2):
+            asyncio.to_thread(
+                gemini_request,
+                image_bytes
+            ),
+
+            timeout=14
+        )
+
+        if not result:
+
+            raise ValueError(
+                "Gemini returned an empty response"
+            )
+
+        result = result.strip()
+
+        if result.startswith("```"):
+
+            result = result.replace(
+                "```json",
+                ""
+            )
+
+            result = result.replace(
+                "```",
+                ""
+            )
+
+            result = result.strip()
 
         try:
 
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_request,
-                    image_bytes
-                ),
-                timeout=18
+            return json.loads(result)
+
+        except json.JSONDecodeError:
+
+            raise ValueError(
+                "Gemini returned invalid JSON"
             )
 
-            if not raw:
+    except asyncio.TimeoutError:
 
-                raise ValueError(
-                    "Gemini returned an empty response"
-                )
+        raise ValueError(
+            "Gemini لم يكمل التحليل خلال 14 ثانية."
+        )
 
-            raw = raw.strip()
+    except Exception as e:
 
-            if raw.startswith("```"):
+        error = str(e)
 
-                raw = raw.replace(
-                    "```json",
-                    ""
-                )
+        if "504" in error:
 
-                raw = raw.replace(
-                    "```",
-                    ""
-                )
-
-                raw = raw.strip()
-
-            try:
-
-                return json.loads(raw)
-
-            except json.JSONDecodeError:
-
-                raise ValueError(
-                    "Gemini returned invalid JSON"
-                )
-
-        except asyncio.TimeoutError:
-
-            last_error = (
-                "⏱ انتهت مهلة التحليل بعد 18 ثانية."
+            raise ValueError(
+                "Gemini 504: انتهت مهلة التحليل."
             )
 
-        except Exception as e:
+        if "503" in error:
 
-            last_error = str(e)
-
-            error_lower = last_error.lower()
-
-            is_busy = (
-                "503" in error_lower
-                or
-                "unavailable" in error_lower
-                or
-                "high demand" in error_lower
-                or
-                "429" in error_lower
+            raise ValueError(
+                "Gemini 503: الخدمة مشغولة حاليًا."
             )
 
-            if is_busy and attempt == 0:
+        if "429" in error:
 
-                await asyncio.sleep(0.7)
+            raise ValueError(
+                "Gemini 429: تم تجاوز حد الطلبات."
+            )
 
-                continue
+        if "404" in error:
 
-            break
+            raise ValueError(
+                "Gemini 404: تحقق من توفر النموذج."
+            )
 
-    raise ValueError(
-        last_error or
-        "Gemini analysis failed"
-    )
+        raise ValueError(error)
 
 
 # ============================================================
-# FORMAT SIGNAL
+# FORMAT
 # ============================================================
 
 def format_signal(data):
@@ -431,15 +466,11 @@ def format_signal(data):
 
     if decision == "DOWN":
 
-        direction = (
-            "🔴 DOWN — بيع (Put)"
-        )
+        direction = "🔴 DOWN — بيع (Put)"
 
     else:
 
-        direction = (
-            "🟢 UP — شراء (Call)"
-        )
+        direction = "🟢 UP — شراء (Call)"
 
 
     confidence = data.get(
@@ -514,6 +545,7 @@ def format_signal(data):
 
 
     return (
+
         "🎓 تحليل زينو\n\n"
 
         f"✅ Solid Setup · {confidence}%\n"
@@ -600,6 +632,7 @@ async def stats(
 
 
     await update.message.reply_text(
+
         "📊 إحصائيات التداول\n\n"
 
         f"✅ WIN: {wins}\n"
@@ -655,13 +688,13 @@ async def photo_handler(
 
 
     status = await update.message.reply_text(
-        "🔎 جاري تحليل الشارت..."
+        "🔎 تحليل سريع..."
     )
 
 
     try:
 
-        # نأخذ أعلى جودة للصورة المرسلة
+        # أعلى جودة للصورة التي أرسلها Telegram
         photo = update.message.photo[-1]
 
         telegram_file = await photo.get_file()
@@ -693,8 +726,10 @@ async def photo_handler(
 
 
         keyboard = InlineKeyboardMarkup(
+
             [
                 [
+
                     InlineKeyboardButton(
                         "✅ WIN",
                         callback_data="trade_win"
@@ -704,13 +739,16 @@ async def photo_handler(
                         "❌ LOSS",
                         callback_data="trade_loss"
                     )
+
                 ]
             ]
         )
 
 
         await status.edit_text(
+
             signal,
+
             reply_markup=keyboard
         )
 
@@ -725,7 +763,8 @@ async def photo_handler(
 
 
         await status.edit_text(
-            "❌ فشل التحليل بسرعة بدل الانتظار الطويل.\n\n"
+
+            "❌ فشل التحليل.\n\n"
             f"{error_text}"
         )
 
@@ -763,6 +802,7 @@ async def button_handler(
         wins += 1
 
         await query.message.reply_text(
+
             "✅ تم تسجيل WIN\n\n"
 
             f"WIN: {wins}\n"
@@ -778,6 +818,7 @@ async def button_handler(
         losses += 1
 
         await query.message.reply_text(
+
             "❌ تم تسجيل LOSS\n\n"
 
             f"WIN: {wins}\n"
@@ -810,13 +851,17 @@ async def error_handler(
 def main():
 
     application = (
+
         ApplicationBuilder()
+
         .token(BOT_TOKEN)
+
         .build()
     )
 
 
     application.add_handler(
+
         CommandHandler(
             "start",
             start
@@ -825,6 +870,7 @@ def main():
 
 
     application.add_handler(
+
         CommandHandler(
             "stats",
             stats
@@ -833,6 +879,7 @@ def main():
 
 
     application.add_handler(
+
         CommandHandler(
             "resetstats",
             reset_stats
@@ -841,6 +888,7 @@ def main():
 
 
     application.add_handler(
+
         MessageHandler(
             filters.PHOTO,
             photo_handler
@@ -849,6 +897,7 @@ def main():
 
 
     application.add_handler(
+
         CallbackQueryHandler(
             button_handler
         )
