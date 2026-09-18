@@ -3,11 +3,29 @@ import io
 import json
 import asyncio
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from google import genai
 from google.genai import types
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+
+# =========================
+# ENVIRONMENT
+# =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -15,540 +33,620 @@ OWNER_ID_TEXT = os.getenv("OWNER_ID")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 if not BOT_TOKEN:
-raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError("BOT_TOKEN is missing")
 
 if not GEMINI_API_KEY:
-raise RuntimeError("GEMINI_API_KEY is missing")
+    raise RuntimeError("GEMINI_API_KEY is missing")
 
 if not OWNER_ID_TEXT:
-raise RuntimeError("OWNER_ID is missing")
+    raise RuntimeError("OWNER_ID is missing")
 
 try:
-OWNER_ID = int(OWNER_ID_TEXT)
+    OWNER_ID = int(OWNER_ID_TEXT)
 except ValueError:
-raise RuntimeError("OWNER_ID must be a number")
+    raise RuntimeError("OWNER_ID must be a number")
+
+
+# =========================
+# GEMINI CLIENT
+# =========================
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-stats = {
-"total": 0,
-"wins": 0,
-"losses": 0
+
+# =========================
+# TIMEZONE UTC-3
+# =========================
+
+UTC_MINUS_3 = timezone(timedelta(hours=-3))
+
+
+# =========================
+# STATS
+# =========================
+
+wins = 0
+losses = 0
+
+
+# =========================
+# ANALYSIS PROMPT
+# =========================
+
+PROMPT = """
+أنت محلل فني متخصص في تحليل صور شارت Quotex.
+
+حلل الصورة المرسلة فقط، ولا تخترع أي بيانات غير ظاهرة.
+
+الاستراتيجية المسموح بها فقط:
+
+1) Keltner Channel 20/10
+- راقب اتجاه القناة وميلها.
+- راقب مكان السعر داخل القناة.
+- راقب الخروج أو الاختراق الواضح من القناة.
+- لمس الحد وحده لا يعني انعكاس.
+
+2) ADX 14/14
+- استخدم ADX لتقييم قوة الاتجاه.
+- استخدم +DI و -DI لتحديد الاتجاه عندما تكون ظاهرة.
+- ADX وحده لا يحدد UP أو DOWN.
+
+3) Price Action
+- راقب فتح وإغلاق الشموع.
+- راقب القمم والقيعان.
+- راقب Higher High / Higher Low.
+- راقب Lower High / Lower Low.
+- راقب قوة جسم الشمعة والظلال.
+- راقب الاختراقات.
+- لا تعتبر الظل وحده اختراقاً مؤكداً.
+- الإغلاق مهم لتأكيد الاختراق.
+- راقب شمعة التأكيد الأخيرة.
+
+ممنوع تماماً استخدام أو ذكر:
+RSI
+MACD
+Moving Average
+EMA
+SMA
+Parabolic SAR
+Stochastic
+Bollinger Bands
+أي مؤشر آخر غير Keltner Channel و ADX.
+
+قواعد القرار:
+
+UP:
+إذا كان هيكل السعر صاعداً، والزخم صاعداً، وKeltner يدعم الصعود، وADX/+DI يدعمان الاتجاه عندما تكون هذه البيانات ظاهرة.
+
+DOWN:
+إذا كان هيكل السعر هابطاً، والزخم هابطاً، وKeltner يدعم الهبوط، وADX/-DI يدعمان الاتجاه عندما تكون هذه البيانات ظاهرة.
+
+لا تجعل جميع الإشارات UP.
+لا تجعل جميع الإشارات DOWN.
+اختر الاتجاه الذي تدعمه الصورة فعلاً.
+
+إذا كان هناك اختراق، لا تؤكده إلا إذا كان إغلاق الشمعة يدعمه.
+
+وقت الدخول:
+- المستخدم يعمل بتوقيت UTC-3.
+- الدخول يكون في بداية الشمعة القادمة مباشرة.
+- احسب وقت الدخول من وقت الشارت الظاهر في الصورة.
+- لا تعطِ وقت انتهاء.
+- لا تقل "بعد X دقائق" إذا كان وقت الدخول يمكن تحديده.
+- لا تعطِ وقت دخول بعد عدة شموع.
+- إذا كانت الشمعة الحالية 2 دقائق، فالدخول يكون عند بداية الشمعة التالية حسب وقت الشارت.
+- لا تخترع وقتاً إذا كان وقت الشارت غير واضح.
+
+شرط الإلغاء:
+اكتب شرط إلغاء مرتبطاً بمستوى أو بنية سعر ظاهرة فعلاً في الصورة.
+لا تخترع مستوى سعري غير ظاهر.
+مثال:
+"إذا أغلقت الشمعة الحالية تحت مستوى X قبل الدخول."
+
+الثقة:
+- اجعل النسبة مبنية على توافق الأدلة الظاهرة.
+- لا تعطِ 90% أو 95% بدون توافق قوي جداً.
+- لا ترفع الثقة لمجرد وجود مؤشر واحد.
+- يجب أن يكون القرار واضحاً UP أو DOWN.
+
+أجب JSON فقط.
+لا تضف Markdown.
+لا تضف ```json.
+"""
+
+
+# =========================
+# JSON SCHEMA
+# =========================
+
+SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "decision": {
+            "type": "STRING",
+            "enum": ["UP", "DOWN"]
+        },
+        "confidence": {
+            "type": "INTEGER"
+        },
+        "asset": {
+            "type": "STRING"
+        },
+        "timeframe": {
+            "type": "STRING"
+        },
+        "chart_time": {
+            "type": "STRING"
+        },
+        "entry_time": {
+            "type": "STRING"
+        },
+        "entry_price": {
+            "type": "STRING"
+        },
+        "trend": {
+            "type": "STRING"
+        },
+        "short_trend": {
+            "type": "STRING"
+        },
+        "structure": {
+            "type": "STRING"
+        },
+        "keltner": {
+            "type": "STRING"
+        },
+        "adx": {
+            "type": "STRING"
+        },
+        "candle": {
+            "type": "STRING"
+        },
+        "reason": {
+            "type": "STRING"
+        },
+        "cancellation": {
+            "type": "STRING"
+        }
+    },
+    "required": [
+        "decision",
+        "confidence",
+        "asset",
+        "timeframe",
+        "chart_time",
+        "entry_time",
+        "entry_price",
+        "trend",
+        "short_trend",
+        "structure",
+        "keltner",
+        "adx",
+        "candle",
+        "reason",
+        "cancellation"
+    ]
 }
+
+
+# =========================
+# HEALTH SERVER
+# =========================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-def do_GET(self):
-    self.send_response(200)
-    self.send_header("Content-Type", "text/plain")
-    self.end_headers()
-    self.wfile.write(b"ZinoQuotexSignalAI is running")
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            b"ZinoQuotexSignalAI is running"
+        )
 
-def log_message(self, format, *args):
-    pass
+    def log_message(self, format, *args):
+        return
+
 
 def start_health_server():
-port = int(os.getenv("PORT", "10000"))
-server = HTTPServer(("0.0.0.0", port), HealthHandler)
-server.serve_forever()
+    port = int(os.getenv("PORT", "10000"))
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    server.serve_forever()
+
 
 threading.Thread(
-target=start_health_server,
-daemon=True
+    target=start_health_server,
+    daemon=True
 ).start()
 
-PROMPT = """
-أنت Zino، محلل شارت Quotex.
 
-حلل صورة الشارت وأعطِ إشارة واحدة فقط:
+# =========================
+# OWNER CHECK
+# =========================
 
-UP = CALL
-DOWN = PUT
+def is_owner(update: Update) -> bool:
 
-اعتمد على المؤشرين فقط:
+    user = update.effective_user
 
-Keltner Channel 20/10
-ADX 14/14
+    if not user:
+        return False
 
-لا تستخدم أي مؤشر آخر.
+    return user.id == OWNER_ID
 
-لا تستخدم RSI.
-لا تستخدم MACD.
-لا تستخدم Moving Average.
-لا تستخدم Parabolic SAR.
-لا تستخدم Stochastic.
-لا تستخدم Bollinger Bands.
-لا تستخدم أي مؤشر إضافي.
 
-حلل حركة السعر والشموع الظاهرة في الصورة مع المؤشرين الأساسيين.
+# =========================
+# GEMINI ANALYSIS
+# =========================
 
-ركز على:
+async def analyze_image(image_bytes: bytes):
 
-اتجاه السعر.
-القمم والقيعان.
-Higher High و Higher Low.
-Lower High و Lower Low.
-افتتاح الشموع.
-إغلاق الشموع.
-قوة جسم الشمعة.
-الذيول.
-الاختراقات.
-إغلاق الاختراق.
-الزخم.
-الشمعة الحالية.
-الشمعة السابقة.
+    def run_gemini():
 
-Keltner Channel 20/10:
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg"
+        )
 
-استخدم Keltner لتحديد اتجاه الحركة، ميل القناة، مكان السعر داخل القناة، والاختراقات.
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                PROMPT,
+                image_part
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SCHEMA,
+                temperature=0.1,
+                max_output_tokens=900
+            )
+        )
 
-ADX 14/14:
+        return response.text
 
-استخدم ADX لمعرفة قوة الاتجاه.
-اقرأ +DI و -DI لمعرفة الطرف المسيطر.
-ADX وحده لا يحدد الاتجاه.
+    raw = await asyncio.to_thread(run_gemini)
 
-UP عندما تكون حركة السعر وKeltner وADX وDI متوافقة في الاتجاه الصاعد.
+    if not raw:
+        raise ValueError("Gemini returned an empty response")
 
-DOWN عندما تكون حركة السعر وKeltner وADX وDI متوافقة في الاتجاه الهابط.
+    raw = raw.strip()
 
-لا تجعل كل الإشارات UP.
-لا تجعل كل الإشارات DOWN.
+    try:
+        return json.loads(raw)
 
-إذا كان الاختراق مجرد ذيل فلا تعتبره اختراقاً مؤكداً.
-أعط أهمية لإغلاق الشمعة.
+    except json.JSONDecodeError:
 
-وقت الدخول:
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "")
+            raw = raw.replace("```", "")
+            raw = raw.strip()
 
-الدخول يكون في بداية الشمعة القادمة مباشرة.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError("Gemini returned invalid JSON")
 
-إذا كان M1:
-الدخول في بداية الدقيقة التالية.
 
-إذا كان M2:
-الدخول في بداية الشمعة التالية ذات الدقيقتين.
-
-اعتمد وقت الشارت الظاهر في الصورة.
-
-منطقة وقت Quotex هي UTC-3.
-
-أعطني وقت الدخول فقط.
-
-لا تعطِ وقت انتهاء.
-
-سعر الدخول:
-استخدم السعر الظاهر في الشارت إذا كان واضحاً.
-
-شرط إلغاء الإشارة:
-يجب أن يكون مرتبطاً بالبنية السعرية الحالية.
-
-UP:
-تلغى الإشارة إذا أغلقت الشمعة الحالية تحت مستوى إبطال الاتجاه الصاعد قبل الدخول.
-
-DOWN:
-تلغى الإشارة إذا أغلقت الشمعة الحالية فوق مستوى إبطال الاتجاه الهابط قبل الدخول.
-
-لا تخترع مستوى عشوائياً.
-
-نسبة الثقة تعتمد على توافق:
-
-حركة السعر
-Keltner 20/10
-ADX 14/14
-+DI / -DI
-الشموع
-الزخم
-
-لا تضع نسبة عشوائية.
-
-أخرج JSON فقط.
-
-لا تستخدم Markdown.
-لا تستخدم ```json.
-لا تكتب أي كلام خارج JSON.
-
-JSON يجب أن يحتوي فقط على:
-
-direction
-confidence
-asset
-timeframe
-chart_time
-entry_time
-entry_price
-cancellation_condition
-trend
-keltner
-adx
-candle
-momentum
-reason
-
-direction:
-UP أو DOWN
-
-confidence:
-رقم من 0 إلى 100.
-
-لا تضف حقولاً أخرى.
-"""
-
-SCHEMA = {
-"type": "OBJECT",
-"properties": {
-"direction": {
-"type": "STRING",
-"enum": ["UP", "DOWN"]
-},
-"confidence": {
-"type": "INTEGER"
-},
-"asset": {
-"type": "STRING"
-},
-"timeframe": {
-"type": "STRING"
-},
-"chart_time": {
-"type": "STRING"
-},
-"entry_time": {
-"type": "STRING"
-},
-"entry_price": {
-"type": "STRING"
-},
-"cancellation_condition": {
-"type": "STRING"
-},
-"trend": {
-"type": "STRING"
-},
-"keltner": {
-"type": "STRING"
-},
-"adx": {
-"type": "STRING"
-},
-"candle": {
-"type": "STRING"
-},
-"momentum": {
-"type": "STRING"
-},
-"reason": {
-"type": "STRING"
-}
-},
-"required": [
-"direction",
-"confidence",
-"asset",
-"timeframe",
-"chart_time",
-"entry_time",
-"entry_price",
-"cancellation_condition",
-"trend",
-"keltner",
-"adx",
-"candle",
-"momentum",
-"reason"
-]
-}
-
-def analyze_image(image_bytes, mime_type):
-
-image = types.Part.from_bytes(
-    data=image_bytes,
-    mime_type=mime_type
-)
-
-response = client.models.generate_content(
-    model=GEMINI_MODEL,
-    contents=[
-        image,
-        PROMPT
-    ],
-    config=types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=SCHEMA,
-        temperature=0.1,
-        max_output_tokens=900
-    )
-)
-
-if not response.text:
-    raise ValueError("Gemini returned an empty response")
-
-try:
-    return json.loads(response.text)
-except json.JSONDecodeError:
-    raise ValueError("Gemini returned invalid JSON")
+# =========================
+# FORMAT SIGNAL
+# =========================
 
 def format_signal(data):
 
-direction = data["direction"]
+    decision = str(data.get("decision", "UP")).upper()
 
-confidence = int(data["confidence"])
+    if decision == "DOWN":
+        direction = "🔴 DOWN — بيع (Put)"
+    else:
+        direction = "🟢 UP — شراء (Call)"
 
-if confidence < 0:
-    confidence = 0
+    confidence = data.get("confidence", 0)
 
-if confidence > 100:
-    confidence = 100
+    asset = data.get("asset", "غير واضح")
+    timeframe = data.get("timeframe", "غير واضح")
 
-if direction == "UP":
-    decision = "🟢 UP — شراء (Call)"
-else:
-    decision = "🔴 DOWN — بيع (Put)"
+    chart_time = data.get("chart_time", "غير واضح")
+    entry_time = data.get("entry_time", "غير واضح")
 
-return (
-    "🎓 تحليل زينو\n"
-    "✅ Solid Setup · " + str(confidence) + "%\n"
-    "📊 " + data["asset"] + " · ⏱ " + data["timeframe"] + "\n"
-    "━━━━━━━━━━━━━━━\n"
-    "🎯 القرار: " + decision + "\n"
-    "🕐 وقت الشارت: " + data["chart_time"] + "\n"
-    "⏰ وقت الدخول: " + data["entry_time"] + "\n"
-    "⏳ مدة الصفقة: " + data["timeframe"] + "\n"
-    "💵 سعر الدخول: " + data["entry_price"] + "\n"
-    "🛑 شرط إلغاء الإشارة: " + data["cancellation_condition"] + "\n"
-    "━━━━━━━━━━━━━━━\n"
-    "📐 الاتجاه: " + data["trend"] + "\n"
-    "📊 Keltner 20/10: " + data["keltner"] + "\n"
-    "📊 ADX 14/14: " + data["adx"] + "\n"
-    "🕯 النموذج: " + data["candle"] + "\n"
-    "📈 الزخم: " + data["momentum"] + "\n"
-    "━━━━━━━━━━━━━━━\n"
-    "🧠 شرح زينو:\n"
-    + data["reason"]
-)
+    entry_price = data.get("entry_price", "غير واضح")
 
-def result_buttons():
+    trend = data.get("trend", "غير واضح")
+    short_trend = data.get("short_trend", "غير واضح")
 
-return InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton(
-            "✅ WIN",
-            callback_data="win"
-        ),
-        InlineKeyboardButton(
-            "❌ LOSS",
-            callback_data="loss"
-        )
-    ]
-])
+    structure = data.get("structure", "غير واضح")
+    keltner = data.get("keltner", "غير واضح")
+    adx = data.get("adx", "غير واضح")
+    candle = data.get("candle", "غير واضح")
+
+    reason = data.get("reason", "غير واضح")
+    cancellation = data.get(
+        "cancellation",
+        "إذا تغيرت البنية السعرية قبل الدخول."
+    )
+
+    text = (
+        "🎓 تحليل زينو\n\n"
+        f"✅ Solid Setup · {confidence}%\n"
+        f"📊 {asset} · ⏱ {timeframe}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🎯 القرار: {direction}\n"
+        f"🕐 وقت الشارت: {chart_time}\n"
+        f"⏰ وقت الدخول: {entry_time}\n"
+        f"💵 سعر الدخول: {entry_price}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"📐 الاتجاه: {trend}\n"
+        f"📈 الاتجاه القصير: {short_trend}\n"
+        f"🏗 البنية السعرية: {structure}\n"
+        f"〽️ Keltner 20/10: {keltner}\n"
+        f"📊 ADX 14/14: {adx}\n"
+        f"🕯 شمعة التأكيد: {candle}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🧠 شرح زينو: {reason}\n\n"
+        f"🛑 شرط إلغاء الإشارة: {cancellation}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "⚠️ التحليل مبني على الصورة المرسلة فقط."
+    )
+
+    return text
+
+
+# =========================
+# START
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-if update.effective_user.id != OWNER_ID:
-    return
+    if not is_owner(update):
+        return
 
-await update.message.reply_text(
-    "Zino جاهز.\n\n"
-    "Keltner Channel 20/10\n"
-    "ADX 14/14\n\n"
-    "أرسل Screenshot للشارت."
-)
+    await update.message.reply_text(
+        "🤖 ZINOSIGNASLQQ جاهز.\n\n"
+        "📸 أرسل صورة الشارت وسأحللها."
+    )
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-if update.effective_user.id != OWNER_ID:
-    return
+# =========================
+# STATS
+# =========================
 
-total = stats["total"]
-wins = stats["wins"]
-losses = stats["losses"]
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-if total:
-    winrate = wins / total * 100
-else:
-    winrate = 0
+    if not is_owner(update):
+        return
 
-await update.message.reply_text(
-    "📊 إحصائيات زينو\n"
-    "━━━━━━━━━━━━━━━\n"
-    "الصفقات: " + str(total) + "\n"
-    "WIN: " + str(wins) + "\n"
-    "LOSS: " + str(losses) + "\n"
-    "Win Rate: " + f"{winrate:.1f}%"
-)
+    total = wins + losses
+
+    if total > 0:
+        winrate = (wins / total) * 100
+    else:
+        winrate = 0
+
+    await update.message.reply_text(
+        "📊 إحصائيات التداول\n\n"
+        f"✅ WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"📌 المجموع: {total}\n"
+        f"🎯 Win Rate: {winrate:.1f}%"
+    )
+
+
+# =========================
+# RESET STATS
+# =========================
 
 async def reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-if update.effective_user.id != OWNER_ID:
-    return
+    global wins
+    global losses
 
-stats["total"] = 0
-stats["wins"] = 0
-stats["losses"] = 0
+    if not is_owner(update):
+        return
 
-await update.message.reply_text(
-    "تم تصفير الإحصائيات."
-)
+    wins = 0
+    losses = 0
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-if update.effective_user.id != OWNER_ID:
-    return
-
-message = update.message
-
-status = await message.reply_text(
-    "🔎 جاري تحليل الشارت..."
-)
-
-try:
-
-    photo = message.photo[-1]
-
-    telegram_file = await photo.get_file()
-
-    buffer = io.BytesIO()
-
-    await telegram_file.download_to_memory(buffer)
-
-    image_bytes = buffer.getvalue()
-
-    if not image_bytes:
-        raise ValueError("الصورة فارغة")
-
-    mime_type = "image/jpeg"
-
-    if image_bytes.startswith(b"\x89PNG"):
-        mime_type = "image/png"
-
-    elif image_bytes.startswith(b"RIFF"):
-        mime_type = "image/webp"
-
-    data = await asyncio.to_thread(
-        analyze_image,
-        image_bytes,
-        mime_type
+    await update.message.reply_text(
+        "♻️ تم تصفير الإحصائيات."
     )
 
-    result = format_signal(data)
 
-    await status.edit_text(
-        result,
-        reply_markup=result_buttons()
+# =========================
+# PHOTO HANDLER
+# =========================
+
+async def photo_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_owner(update):
+        return
+
+    message = update.message
+
+    if not message or not message.photo:
+        return
+
+    status_message = await message.reply_text(
+        "🔎 جاري تحليل الشارت..."
     )
 
-except Exception as e:
+    try:
 
-    error = str(e)
+        photo = message.photo[-1]
 
-    if len(error) > 700:
-        error = error[:700]
+        file = await photo.get_file()
 
-    await status.edit_text(
-        "❌ حدث خطأ أثناء التحليل:\n\n" + error
-    )
+        image_buffer = io.BytesIO()
 
-async def result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await file.download_to_memory(
+            out=image_buffer
+        )
 
-query = update.callback_query
+        image_bytes = image_buffer.getvalue()
 
-if query.from_user.id != OWNER_ID:
+        if not image_bytes:
+            raise ValueError("الصورة فارغة")
+
+        data = await analyze_image(image_bytes)
+
+        signal_text = format_signal(data)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ WIN",
+                        callback_data="trade_win"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ LOSS",
+                        callback_data="trade_loss"
+                    )
+                ]
+            ]
+        )
+
+        await status_message.edit_text(
+            signal_text,
+            reply_markup=keyboard
+        )
+
+    except Exception as e:
+
+        error_text = str(e)
+
+        if len(error_text) > 1000:
+            error_text = error_text[:1000]
+
+        await status_message.edit_text(
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{error_text}"
+        )
+
+
+# =========================
+# WIN / LOSS BUTTONS
+# =========================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global wins
+    global losses
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer()
+        return
+
     await query.answer()
-    return
 
-await query.answer()
+    if query.data == "trade_win":
 
-if query.data == "win":
+        wins += 1
 
-    stats["wins"] += 1
-    stats["total"] += 1
+        await query.message.reply_text(
+            f"✅ تم تسجيل WIN\n\n"
+            f"WIN: {wins}\n"
+            f"LOSS: {losses}\n"
+            f"TOTAL: {wins + losses}"
+        )
 
-    message = "✅ تم تسجيل WIN"
+    elif query.data == "trade_loss":
 
-elif query.data == "loss":
+        losses += 1
 
-    stats["losses"] += 1
-    stats["total"] += 1
+        await query.message.reply_text(
+            f"❌ تم تسجيل LOSS\n\n"
+            f"WIN: {wins}\n"
+            f"LOSS: {losses}\n"
+            f"TOTAL: {wins + losses}"
+        )
 
-    message = "❌ تم تسجيل LOSS"
 
-else:
-    return
+# =========================
+# ERROR HANDLER
+# =========================
 
-total = stats["total"]
-wins = stats["wins"]
-losses = stats["losses"]
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-if total:
-    winrate = wins / total * 100
-else:
-    winrate = 0
+    print(
+        "Telegram error:",
+        context.error
+    )
 
-await query.edit_message_reply_markup(
-    reply_markup=None
-)
 
-await query.message.reply_text(
-    message + "\n\n"
-    "📊 الصفقات: " + str(total) + "\n"
-    "✅ WIN: " + str(wins) + "\n"
-    "❌ LOSS: " + str(losses) + "\n"
-    "🎯 Win Rate: " + f"{winrate:.1f}%"
-)
-
-async def error_handler(update, context):
-
-print(
-    "Telegram error:",
-    context.error
-)
+# =========================
+# MAIN
+# =========================
 
 def main():
 
-print("ZinoQuotexSignalAI starting...")
-print("Keltner Channel 20/10")
-print("ADX 14/14")
-print("Gemini model:", GEMINI_MODEL)
-
-app = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .build()
-)
-
-app.add_handler(
-    CommandHandler("start", start)
-)
-
-app.add_handler(
-    CommandHandler("stats", stats_command)
-)
-
-app.add_handler(
-    CommandHandler("resetstats", reset_stats)
-)
-
-app.add_handler(
-    MessageHandler(
-        filters.PHOTO,
-        photo_handler
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
     )
-)
 
-app.add_handler(
-    CallbackQueryHandler(
-        result_handler,
-        pattern="^(win|loss)$"
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
-)
 
-app.add_error_handler(
-    error_handler
-)
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats
+        )
+    )
 
-app.run_polling(
-    allowed_updates=Update.ALL_TYPES,
-    drop_pending_updates=True
-)
+    application.add_handler(
+        CommandHandler(
+            "resetstats",
+            reset_stats
+        )
+    )
 
-if name == "main":
-main()
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    print(
+        "ZinoQuotexSignalAI started successfully."
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
