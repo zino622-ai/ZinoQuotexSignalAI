@@ -1,10 +1,10 @@
 import os
-import io
 import json
-import asyncio
+import re
+import logging
 import threading
-from datetime import timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timedelta, timezone
+from PIL import Image
 from google import genai
 from google.genai import types
 from telegram import (
@@ -12,8 +12,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -22,20 +22,24 @@ from telegram.ext import (
     filters,
 )
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 
 # ============================================================
-# SETTINGS
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_ID_TEXT = os.getenv("OWNER_ID")
+OWNER_ID = os.getenv("OWNER_ID")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-# الموديل الحالي الذي يعمل عندك
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+PORT = int(os.getenv("PORT", "10000"))
 
-# توقيت Quotex
-UTC_MINUS_3 = timezone(timedelta(hours=-3))
+TIMEFRAME = "2M"
+
+# Quotex timezone requested by user: UTC-3
+USER_TIMEZONE = timezone(timedelta(hours=-3))
 
 
 if not BOT_TOKEN:
@@ -44,617 +48,56 @@ if not BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing")
 
-if not OWNER_ID_TEXT:
+if not OWNER_ID:
     raise RuntimeError("OWNER_ID is missing")
 
 try:
-    OWNER_ID = int(OWNER_ID_TEXT)
+    OWNER_ID = int(OWNER_ID)
 except ValueError:
-    raise RuntimeError("OWNER_ID must be a number")
+    raise RuntimeError("OWNER_ID must be an integer")
 
 
 # ============================================================
-# GEMINI CLIENT
+# LOGGING
 # ============================================================
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(
-        timeout=15000
-    )
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
-
-# ============================================================
-# STATS
-# ============================================================
-
-wins = 0
-losses = 0
+logger = logging.getLogger("ZinoQuotexSignalAI")
 
 
 # ============================================================
-# ANALYSIS PROMPT
+# GEMINI
 # ============================================================
 
-PROMPT = """
-أنت ZINO SIGNAL AI.
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-مهمتك تحليل صورة شارت Quotex المرسلة فقط، ثم اختيار اتجاه واحد:
 
-UP أو DOWN
+# ============================================================
+# SIMPLE STATS
+# ============================================================
 
-أنت محلل صارم.
-لا تحاول إعطاء UP دائمًا.
-لا تحاول إعطاء DOWN دائمًا.
-كل صورة يتم تحليلها بشكل مستقل.
-
-ممنوع اختراع أي معلومة غير ظاهرة في الصورة.
-
-============================================================
-أولًا: PRICE ACTION
-============================================================
-
-Price Action هو العنصر الأساسي في التحليل.
-
-افحص آخر 8 إلى 15 شمعة ظاهرة بوضوح قدر الإمكان.
-
-حلل:
-
-- Open
-- Close
-- High
-- Low
-- جسم الشمعة
-- الظلال / Wicks
-- قوة الشموع
-- القمم والقيعان
-- Higher High
-- Higher Low
-- Lower High
-- Lower Low
-- Breakout
-- Fake Breakout
-- Rejection
-- Consolidation
-- آخر شمعة مغلقة
-
-أعطِ أهمية أكبر للشموع الأخيرة.
-
-إذا كان السعر يصنع:
-
-Higher High + Higher Low
-فهذا دليل صاعد.
-
-إذا كان السعر يصنع:
-
-Lower High + Lower Low
-فهذا دليل هابط.
-
-لكن لا تعتمد على الاتجاه العام وحده.
-يجب فحص آخر حركة للسعر أيضًا.
-
-============================================================
-BREAKOUT
-============================================================
-
-لا تعتبر الـ Wick وحده اختراقًا.
-
-اختراق حقيقي يحتاج إغلاق شمعة واضح خارج المستوى أو القمة/القاع المهمة.
-
-إذا تجاوز السعر المستوى بالـ Wick فقط ثم عاد وأغلق داخله:
-
-اعتبر ذلك رفضًا أو Fake Breakout.
-
-لا تبني UP أو DOWN قوي على Wick فقط.
-
-الإغلاق أهم من مجرد اللمس.
-
-============================================================
-آخر شمعة مغلقة
-============================================================
-
-ركز على آخر شمعة مكتملة.
-
-افحص:
-
-- هل أغلقت صاعدة أم هابطة؟
-- هل جسمها قوي أم ضعيف؟
-- أين أغلقت بالنسبة إلى نطاقها؟
-- هل لها Wick طويل؟
-- هل تؤكد الاتجاه؟
-- هل تعارض الاتجاه؟
-- هل جاءت بعد Breakout؟
-- هل جاءت بعد Rejection؟
-
-لا تعتبر الشمعة الحالية التي لم تغلق تأكيدًا كاملًا.
-
-============================================================
-ثانيًا: KELTNER CHANNEL
-============================================================
-
-استخدم Keltner Channel الظاهر في الصورة فقط.
-
-الإعداد:
-
-Keltner Channel 20 / 10
-
-افحص:
-
-- اتجاه القناة.
-- ميل القناة.
-- مكان السعر داخل القناة.
-- موقع السعر بالنسبة للخط الأوسط.
-- هل السعر يتحرك مع اتجاه القناة؟
-- هل يوجد Breakout واضح؟
-- هل يوجد Rejection؟
-
-مهم:
-
-مجرد لمس الحد العلوي لا يعني تلقائيًا DOWN.
-
-مجرد لمس الحد السفلي لا يعني تلقائيًا UP.
-
-Keltner لا يستطيع وحده تحديد القرار.
-
-يجب دمجه مع Price Action و ADX.
-
-لا تخترع قيم Keltner غير الظاهرة.
-
-============================================================
-ثالثًا: ADX
-============================================================
-
-استخدم ADX الظاهر في الصورة فقط.
-
-الإعداد:
-
-ADX 14 / 14
-
-افحص:
-
-- قوة الاتجاه.
-- ADX.
-- +DI.
-- -DI.
-
-إذا كان +DI يدعم الحركة الصاعدة:
-هذا عامل لصالح UP.
-
-إذا كان -DI يدعم الحركة الهابطة:
-هذا عامل لصالح DOWN.
-
-ADX وحده لا يحدد الاتجاه.
-
-إذا كان الاتجاه ضعيفًا أو السوق يتحرك جانبيًا:
-اخفض الثقة.
-
-لا تخترع رقم ADX أو DI إذا لم يكن واضحًا في الصورة.
-
-============================================================
-ترتيب الأدلة
-============================================================
-
-رتب الأدلة بهذا الترتيب:
-
-1. Price Action / Market Structure
-2. آخر شمعة مغلقة
-3. Breakout أو Rejection
-4. Keltner Channel
-5. ADX + DI
-
-Price Action هو الأساس.
-
-============================================================
-قرار UP
-============================================================
-
-اختر UP عندما تكون الأدلة الصاعدة هي الأقوى.
-
-أمثلة على الأدلة:
-
-- Higher High / Higher Low.
-- آخر شمعة مغلقة صاعدة.
-- إغلاق قوي في الاتجاه الصاعد.
-- Breakout صاعد مؤكد بالإغلاق.
-- Rejection هابط ثم إغلاق صاعد.
-- Keltner يدعم الاتجاه الصاعد.
-- +DI يدعم الحركة عندما يكون ظاهرًا.
-
-لا تعطِ UP بثقة عالية إذا كانت البنية السعرية هابطة بوضوح.
-
-============================================================
-قرار DOWN
-============================================================
-
-اختر DOWN عندما تكون الأدلة الهابطة هي الأقوى.
-
-أمثلة على الأدلة:
-
-- Lower High / Lower Low.
-- آخر شمعة مغلقة هابطة.
-- إغلاق قوي في الاتجاه الهابط.
-- Breakout هابط مؤكد بالإغلاق.
-- Rejection صاعد ثم إغلاق هابط.
-- Keltner يدعم الاتجاه الهابط.
-- -DI يدعم الحركة عندما يكون ظاهرًا.
-
-لا تعطِ DOWN بثقة عالية إذا كانت البنية السعرية صاعدة بوضوح.
-
-============================================================
-CONSOLIDATION / RANGE
-============================================================
-
-إذا كان السوق يتحرك أفقيًا:
-
-- لا تعتبر كل شمعة اتجاهًا.
-- لا تعتبر كل Wick اختراقًا.
-- لا تعتبر لمس Keltner انعكاسًا تلقائيًا.
-- ابحث عن إغلاق مؤكد خارج النطاق.
-- إذا لم يوجد Breakout مؤكد، اعتبر السوق ضعيف الاتجاه.
-
-إذا كانت الأدلة مختلطة:
-اختر الاتجاه الذي لديه أقوى دليل واضح،
-لكن اخفض Confidence.
-
-لا تصنع ثقة عالية من سوق جانبي.
-
-============================================================
-CONFIDENCE
-============================================================
-
-Confidence يجب أن تعكس قوة الأدلة الحقيقية.
-
-50-59%:
-أدلة ضعيفة أو سوق جانبي أو تعارض واضح.
-
-60-69%:
-اتجاه موجود لكن التأكيد متوسط.
-
-70-79%:
-عدة عوامل متفقة بقوة.
-
-80-85%:
-فقط عندما تكون:
-
-Price Action
-+
-آخر شمعة
-+
-Breakout/Rejection
-+
-Keltner
-+
-ADX/DI
-
-متفقة بشكل قوي ولا يوجد تعارض مهم.
-
-لا تستخدم أكثر من 85%.
-
-لا تستخدم 80% فقط لأن عدة شموع خضراء أو حمراء ظهرت.
-
-لا ترفع الثقة لمجرد أن Keltner وADX يؤيدان الاتجاه إذا كان Price Action يعارضه.
-
-============================================================
-قاعدة التعارض
-============================================================
-
-إذا كانت الأدلة متعارضة:
-
-لا تتجاهل التعارض.
-
-مثال:
-
-Price Action = DOWN
-لكن Keltner = UP
-
-هنا لا تعطي Confidence عالية.
-
-مثال آخر:
-
-Price Action = UP
-لكن آخر شمعة مغلقة هابطة بقوة وتحت مستوى مهم.
-
-هنا يجب تخفيض Confidence.
-
-القرار النهائي يجب أن يعتمد على أقوى مجموعة أدلة، وليس على مؤشر واحد.
-
-============================================================
-التوازن بين UP و DOWN
-============================================================
-
-لا يوجد أي تفضيل مسبق لـ UP.
-
-لا يوجد أي تفضيل مسبق لـ DOWN.
-
-لا تحاول تعويض الإشارة السابقة.
-
-إذا كانت الإشارة السابقة UP:
-هذا لا يعني أن الحالية يجب أن تكون DOWN.
-
-إذا كانت الإشارة السابقة DOWN:
-هذا لا يعني أن الحالية يجب أن تكون UP.
-
-حلل الصورة الحالية فقط.
-
-============================================================
-TIMEFRAME
-============================================================
-
-المستخدم يعمل على Quotex بإطار:
-
-2M
-
-إذا كان الإطار ظاهرًا في الصورة:
-اقرأه.
-
-إذا كان غير ظاهر:
-استخدم 2M لأن المستخدم يعمل عليه.
-
-لا تخترع إطارًا آخر.
-
-============================================================
-ENTRY TIME
-============================================================
-
-توقيت المستخدم:
-
-UTC-3
-
-الدخول يكون في بداية الشمعة القادمة.
-
-اقرأ وقت الشارت إذا كان ظاهرًا.
-
-بما أن الإطار 2M:
-حدد بداية الشمعة القادمة بناءً على وقت الشارت.
-
-أعطِ وقت الدخول فقط.
-
-ممنوع إعطاء وقت انتهاء.
-
-ممنوع إعطاء Expiry.
-
-ممنوع قول:
-"بعد ساعة".
-
-ممنوع قول:
-"بعد عدة دقائق" بدون وقت محدد.
-
-إذا كان وقت الشارت غير واضح:
-entry_time = "غير واضح"
-
-============================================================
-ENTRY PRICE
-============================================================
-
-إذا كان سعر الدخول يمكن تحديده من الصورة:
-ضعه.
-
-إذا لم يكن واضحًا:
-entry_price = "غير واضح"
-
-لا تخترع سعرًا.
-
-============================================================
-ASSET
-============================================================
-
-اقرأ اسم الأصل من الصورة.
-
-إذا كان واضحًا:
-استخدمه.
-
-إذا لم يكن واضحًا:
-asset = "غير واضح"
-
-لا تخترع اسم الأصل.
-
-============================================================
-CANCELLATION
-============================================================
-
-شرط الإلغاء يجب أن يعتمد على مستوى واضح في الصورة.
-
-مثال:
-
-"تُلغى الإشارة إذا أغلقت شمعة قبل الدخول عكس مستوى الاختراق."
-
-إذا لم يوجد مستوى واضح:
-cancellation = "غير واضح"
-
-لا تخترع رقمًا أو مستوى.
-
-============================================================
-ممنوع استخدام أي مؤشر إضافي
-============================================================
-
-استخدم فقط:
-
-1. Price Action
-2. Keltner Channel 20/10
-3. ADX 14/14
-
-ممنوع استخدام:
-
-RSI
-MACD
-EMA
-SMA
-Moving Average
-Parabolic SAR
-Stochastic
-Bollinger Bands
-أو أي مؤشر آخر.
-
-============================================================
-FINAL DECISION
-============================================================
-
-يجب إعطاء قرار واحد فقط:
-
-UP
-
-أو
-
-DOWN
-
-لا تستخدم:
-
-CALL
-PUT
-NO SIGNAL
-
-حتى عندما تكون الثقة ضعيفة، اختر الاتجاه الذي تدعمه الأدلة الأقوى وخفض Confidence بدل اختراع ثقة عالية.
-
-============================================================
-OUTPUT
-============================================================
-
-أرجع JSON صالح فقط.
-
-بدون Markdown.
-بدون ```json.
-بدون أي كلام خارج JSON.
-
-استخدم هذه الحقول فقط:
-
-{
-  "decision": "UP أو DOWN",
-  "confidence": 0,
-  "asset": "اسم الأصل",
-  "timeframe": "2M",
-  "chart_time": "وقت الشارت",
-  "entry_time": "وقت بداية الشمعة القادمة UTC-3",
-  "entry_price": "سعر الدخول أو غير واضح",
-  "trend": "Bullish أو Bearish أو Sideways",
-  "short_trend": "Bullish أو Bearish أو Sideways",
-  "structure": "وصف مختصر للقمم والقيعان والاختراق",
-  "keltner": "وصف مختصر لحالة Keltner",
-  "adx": "وصف مختصر لـ ADX وDI",
-  "candle": "وصف مختصر لآخر شمعة مغلقة",
-  "reason": "السبب الرئيسي للقرار",
-  "cancellation": "شرط إلغاء الإشارة"
+stats = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
 }
 
-الدقة أهم من الكلام.
-
-حلل الصورة أولًا.
-حدد Market Structure.
-ثم افحص آخر شمعة مغلقة.
-ثم Breakout أو Rejection.
-ثم Keltner.
-ثم ADX وDI.
-ثم قارن الأدلة.
-ثم اختر UP أو DOWN.
-ثم حدد Confidence حسب قوة التأكيد الحقيقية.
-"""
+last_signal = None
 
 
 # ============================================================
-# JSON SCHEMA
-# ============================================================
-
-SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-
-        "decision": {
-            "type": "STRING",
-            "enum": ["UP", "DOWN"]
-        },
-
-        "confidence": {
-            "type": "INTEGER"
-        },
-
-        "asset": {
-            "type": "STRING"
-        },
-
-        "timeframe": {
-            "type": "STRING"
-        },
-
-        "chart_time": {
-            "type": "STRING"
-        },
-
-        "entry_time": {
-            "type": "STRING"
-        },
-
-        "entry_price": {
-            "type": "STRING"
-        },
-
-        "trend": {
-            "type": "STRING"
-        },
-
-        "short_trend": {
-            "type": "STRING"
-        },
-
-        "structure": {
-            "type": "STRING"
-        },
-
-        "keltner": {
-            "type": "STRING"
-        },
-
-        "adx": {
-            "type": "STRING"
-        },
-
-        "candle": {
-            "type": "STRING"
-        },
-
-        "reason": {
-            "type": "STRING"
-        },
-
-        "cancellation": {
-            "type": "STRING"
-        }
-    },
-
-    "required": [
-        "decision",
-        "confidence",
-        "asset",
-        "timeframe",
-        "chart_time",
-        "entry_time",
-        "entry_price",
-        "trend",
-        "short_trend",
-        "structure",
-        "keltner",
-        "adx",
-        "candle",
-        "reason",
-        "cancellation"
-    ]
-}
-
-
-# ============================================================
-# HEALTH SERVER
+# HEALTH SERVER FOR RENDER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-
         self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
 
         self.wfile.write(
@@ -666,250 +109,609 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
-
     server = HTTPServer(
-        ("0.0.0.0", port),
+        ("0.0.0.0", PORT),
         HealthHandler
     )
 
-    server.serve_forever()
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
 
+    thread.start()
 
-threading.Thread(
-    target=start_health_server,
-    daemon=True
-).start()
+    logger.info("Health server running on port %s", PORT)
 
 
 # ============================================================
-# OWNER
+# OWNER CHECK
 # ============================================================
 
-def is_owner(update: Update):
+def is_owner(update: Update) -> bool:
 
-    user = update.effective_user
-
-    if not user:
+    if not update.effective_user:
         return False
 
-    return user.id == OWNER_ID
+    return update.effective_user.id == OWNER_ID
 
 
 # ============================================================
-# GEMINI REQUEST
+# TIME
 # ============================================================
 
-def gemini_request(image_bytes):
+def now_user_time():
+    return datetime.now(USER_TIMEZONE)
 
-    image_part = types.Part.from_bytes(
-        data=image_bytes,
-        mime_type="image/jpeg"
+
+def next_candle_time():
+
+    now = now_user_time()
+
+    # 2-minute candle boundaries
+    minute = now.minute
+
+    next_even_minute = minute + (2 - minute % 2)
+
+    if next_even_minute >= 60:
+
+        target = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+    else:
+
+        target = now.replace(
+            minute=next_even_minute,
+            second=0,
+            microsecond=0
+        )
+
+    # Safety:
+    # never allow entry time to be equal to or earlier than current time.
+    if target <= now:
+        target += timedelta(minutes=2)
+
+    return target
+
+
+# ============================================================
+# GEMINI PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = r"""
+أنت Zino، محلل فني متخصص في تحليل صور شارت Quotex.
+
+مهمتك تحليل صورة الشارت فقط وإعطاء إشارة اتجاهية واضحة:
+UP = CALL
+DOWN = PUT
+
+الإطار الزمني المطلوب:
+2M
+
+لا تكتب NO SIGNAL.
+
+لكن لا تعطِ ثقة مرتفعة لمجرد وجود شمعة واحدة.
+
+============================================================
+القواعد الأساسية للتحليل
+============================================================
+
+1) الاتجاه العام:
+
+حدد الاتجاه العام من بنية السعر:
+
+Bullish:
+Higher Highs + Higher Lows
+
+Bearish:
+Lower Highs + Lower Lows
+
+Sideways:
+السعر يتحرك داخل نطاق بدون اتجاه واضح.
+
+الاتجاه العام مهم جدًا.
+
+============================================================
+
+2) الاتجاه القصير:
+
+حلل آخر عدة شموع فقط لمعرفة الزخم القصير.
+
+لا تجعل الاتجاه القصير يلغي الاتجاه العام بسهولة.
+
+إذا كان:
+General = Bullish
+Short = Bearish
+
+فهذا غالبًا تصحيح، وليس تلقائيًا إشارة DOWN.
+
+إذا كان:
+General = Bearish
+Short = Bullish
+
+فهذا غالبًا ارتداد، وليس تلقائيًا إشارة UP.
+
+============================================================
+
+3) MARKET STRUCTURE
+
+ركز على:
+
+- Higher High
+- Higher Low
+- Lower High
+- Lower Low
+- Breakout
+- Breakdown
+- Retest
+- Fake breakout
+- Liquidity sweep
+- rejection
+- consolidation
+
+لا تعتبر مجرد لمس مستوى أو Keltner سببًا كافيًا للدخول.
+
+============================================================
+
+4) CANDLE CONFIRMATION
+
+افحص آخر شمعة مغلقة:
+
+- Bullish candle
+- Bearish candle
+- rejection candle
+- hammer
+- pin bar
+- engulfing
+- strong body
+- weak body
+- close near high
+- close near low
+
+شمعة صغيرة وحدها ليست تأكيدًا قويًا.
+
+============================================================
+
+5) BREAKOUT
+
+إذا حدث breakout:
+
+لا تعتبره صالحًا مباشرة.
+
+افحص:
+
+- هل أغلقت الشمعة فوق المستوى؟
+- هل الإغلاق قوي؟
+- هل يوجد follow-through؟
+- هل breakout حدث داخل consolidation؟
+- هل هناك احتمال fake breakout؟
+
+إذا كان breakout ضعيفًا، خفض الثقة.
+
+============================================================
+
+6) KELTNER
+
+يمكن استخدام Keltner كعامل مساعد فقط.
+
+لا تستخدم:
+"لمس الحد العلوي = DOWN"
+
+ولا:
+"لمس الحد السفلي = UP"
+
+يجب أن يتوافق Keltner مع:
+
+Price Structure
+Momentum
+Candle Confirmation
+
+============================================================
+
+7) ADX / DI
+
+ADX عامل مساعد.
+
+ADX منخفض:
+السوق ضعيف الاتجاه / قد يكون Sideways.
+
+لا تعطِ 75% أو 80% ثقة عندما يكون ADX ضعيفًا جدًا إلا إذا كانت هناك بنية سعرية واضحة جدًا.
+
+DI+ فوق DI- يدعم الصعود.
+
+DI- فوق DI+ يدعم الهبوط.
+
+لكن DI وحده ليس سببًا كافيًا للدخول.
+
+============================================================
+
+8) SIDEWAYS
+
+إذا كان السوق Sideways:
+
+لا تعتمد على شمعة صغيرة واحدة.
+
+UP يحتاج:
+- rejection واضح من قاع النطاق
+أو
+- breakout مؤكد للأعلى
+
+DOWN يحتاج:
+- rejection واضح من قمة النطاق
+أو
+- breakdown مؤكد للأسفل
+
+إذا كان التأكيد ضعيفًا، لا ترفع confidence.
+
+============================================================
+
+9) تجنب مطاردة الحركة
+
+إذا كانت آخر شمعة قوية جدًا وامتدت الحركة بالفعل:
+
+لا تفترض أن الشمعة التالية ستكمل بنفس القوة.
+
+ابحث عن:
+- استمرار حقيقي
+- retest
+- confirmation
+
+============================================================
+
+10) توافق الاتجاه
+
+الأولوية:
+
+1. Market Structure
+2. General Trend
+3. Short Trend
+4. Breakout / Breakdown
+5. Candle Confirmation
+6. Momentum
+7. Keltner
+8. ADX / DI
+
+لا تجعل مؤشرًا واحدًا يتغلب على البنية السعرية.
+
+============================================================
+CONFIDENCE
+============================================================
+
+Confidence ليس رقمًا عشوائيًا.
+
+تقريبًا:
+
+55-60:
+إشارة ضعيفة نسبيًا.
+
+61-67:
+تأكيد متوسط.
+
+68-74:
+عدة عوامل متوافقة.
+
+75-82:
+توافق قوي جدًا بين الاتجاه والبنية والزخم والتأكيد.
+
+لا تستخدم 80% لمجرد أن شمعة واحدة قوية.
+
+إذا كان الاتجاه العام Sideways وADX ضعيفًا:
+لا ترفع confidence بسهولة.
+
+============================================================
+ENTRY TIME
+============================================================
+
+البوت يعمل على شارت 2M.
+
+وقت الدخول يجب أن يكون وقتًا مستقبليًا.
+
+لا تعطِ وقتًا مساويًا أو أقدم من وقت الشارت.
+
+يفضل الدخول في بداية شمعة 2M مستقبلية.
+
+============================================================
+ENTRY PRICE
+============================================================
+
+استخرج سعر الدخول من الصورة إذا كان واضحًا.
+
+إذا لم يكن السعر ظاهرًا بوضوح:
+استخدم آخر سعر واضح في الشارت.
+
+============================================================
+CANCELLATION LEVEL
+============================================================
+
+قاعدة مهمة جدًا:
+
+مستوى إلغاء الإشارة يجب أن يكون دائمًا أقل من سعر الدخول.
+
+مثال:
+
+سعر الدخول:
+14.86839
+
+الإلغاء:
+14.86650
+
+صيغة النص:
+
+🛑 إلغاء إذا أغلقت شمعة تحت 14.86650
+
+ممنوع أن يكون مستوى الإلغاء مساويًا لسعر الدخول.
+
+ممنوع أن يكون أعلى من سعر الدخول.
+
+حتى إذا كانت الإشارة DOWN، يجب أن يبقى مستوى الإلغاء أقل من سعر الدخول، لأن المستخدم يريد مقارنة المستويين مباشرة.
+
+اختر مستوى إلغاء منطقيًا أسفل سعر الدخول، ويفضل أن يكون أسفل قاع/منطقة قريبة من البنية السعرية بدل رقم عشوائي.
+
+============================================================
+IMPORTANT
+============================================================
+
+لا تخترع بيانات غير ظاهرة في الصورة.
+
+إذا لم تستطع قراءة الأصل، حاول استخراجه من الشارت.
+
+لا تضف Support/Resistance section منفصلة.
+
+ركز على:
+
+Price Action
+Market Structure
+Breakout
+Candle Confirmation
+Momentum
+Keltner
+ADX
+
+============================================================
+OUTPUT
+============================================================
+
+أخرج JSON فقط.
+
+بدون Markdown.
+
+بدون ```.
+
+بدون شرح خارج JSON.
+
+الصيغة:
+
+{
+  "confidence": 72,
+  "direction": "DOWN",
+  "asset": "USD/ZAR",
+  "timeframe": "2M",
+  "general_trend": "Bearish",
+  "short_trend": "Bearish",
+  "structure": "Lower highs and lower lows with bearish continuation",
+  "keltner": "Price rejected the upper area and moved lower",
+  "adx": "Bearish DI alignment with improving trend strength",
+  "confirmation_candle": "Strong bearish candle closing near its low",
+  "reason": "Bearish structure, momentum and candle confirmation are aligned",
+  "entry_price": 14.86969,
+  "entry_delay_minutes": 2,
+  "cancellation_price": 14.86650
+}
+
+شروط JSON:
+
+confidence:
+رقم صحيح بين 50 و85.
+
+direction:
+UP أو DOWN فقط.
+
+entry_delay_minutes:
+عدد صحيح بين 1 و3 فقط.
+
+cancellation_price:
+رقم أقل من entry_price دائمًا.
+
+إذا كان cancellation_price >= entry_price:
+يجب تصحيحه قبل إخراج JSON.
+
+لا تضع وقت الدخول النصي داخل JSON.
+البرنامج سيحسب وقت الدخول بنفسه.
+"""
+
+
+# ============================================================
+# JSON CLEANING
+# ============================================================
+
+def extract_json(text: str):
+
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Remove markdown fences
+    text = re.sub(
+        r"^```(?:json)?",
+        "",
+        text,
+        flags=re.IGNORECASE
     )
+
+    text = re.sub(
+        r"```$",
+        "",
+        text
+    )
+
+    text = text.strip()
+
+    # Direct JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Search JSON object
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL
+    )
+
+    if match:
+
+        candidate = match.group(0)
+
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    return None
+
+
+# ============================================================
+# GEMINI ANALYSIS
+# ============================================================
+
+def analyze_image(image: Image.Image):
 
     response = client.models.generate_content(
-
         model=GEMINI_MODEL,
-
         contents=[
-            PROMPT,
-            image_part
+            types.Part.from_bytes(
+                data=image_to_bytes(image),
+                mime_type="image/png"
+            ),
+            SYSTEM_PROMPT,
         ],
-
         config=types.GenerateContentConfig(
-
+            temperature=0.15,
+            max_output_tokens=1200,
             response_mime_type="application/json",
-
-            response_schema=SCHEMA,
-
-            temperature=0.0,
-
-            max_output_tokens=500
-        )
+        ),
     )
 
-    return response.text
+    text = getattr(response, "text", None)
+
+    if not text:
+        raise RuntimeError(
+            "Gemini returned an empty response"
+        )
+
+    data = extract_json(text)
+
+    if not data:
+        raise RuntimeError(
+            "Gemini returned invalid JSON"
+        )
+
+    return data
+
+
+def image_to_bytes(image: Image.Image):
+
+    import io
+
+    buffer = io.BytesIO()
+
+    # Do NOT resize the image.
+    # Keep original resolution/quality.
+    image.save(
+        buffer,
+        format="PNG"
+    )
+
+    return buffer.getvalue()
 
 
 # ============================================================
-# ANALYZE
+# VALIDATE ANALYSIS
 # ============================================================
 
-async def analyze_image(image_bytes):
+def validate_analysis(data):
+
+    direction = str(
+        data.get("direction", "")
+    ).upper().strip()
+
+    if direction not in ("UP", "DOWN"):
+        raise RuntimeError(
+            "Gemini returned invalid direction"
+        )
 
     try:
+        confidence = int(
+            data.get("confidence", 0)
+        )
+    except Exception:
+        confidence = 0
 
-        result = await asyncio.wait_for(
+    confidence = max(
+        50,
+        min(85, confidence)
+    )
 
-            asyncio.to_thread(
-                gemini_request,
-                image_bytes
-            ),
-
-            timeout=14
+    try:
+        entry_price = float(
+            data.get("entry_price")
+        )
+    except Exception:
+        raise RuntimeError(
+            "Gemini did not return a valid entry price"
         )
 
-        if not result:
-
-            raise ValueError(
-                "Gemini returned an empty response"
-            )
-
-        result = result.strip()
-
-        if result.startswith("```"):
-
-            result = result.replace(
-                "```json",
-                ""
-            )
-
-            result = result.replace(
-                "```",
-                ""
-            )
-
-            result = result.strip()
-
-        try:
-
-            data = json.loads(result)
-
-        except json.JSONDecodeError:
-
-            raise ValueError(
-                "Gemini returned invalid JSON"
-            )
-
-        # ====================================================
-        # VALIDATE DECISION
-        # ====================================================
-
-        decision = str(
-            data.get(
-                "decision",
-                ""
-            )
-        ).upper()
-
-        if decision not in ["UP", "DOWN"]:
-
-            raise ValueError(
-                "Invalid decision returned by Gemini"
-            )
-
-        data["decision"] = decision
-
-        # ====================================================
-        # LIMIT CONFIDENCE
-        # ====================================================
-
-        try:
-
-            confidence = int(
-                data.get(
-                    "confidence",
-                    0
-                )
-            )
-
-        except (ValueError, TypeError):
-
-            confidence = 0
-
-        confidence = max(
-            50,
-            min(
-                confidence,
-                85
-            )
+    try:
+        cancellation_price = float(
+            data.get("cancellation_price")
+        )
+    except Exception:
+        raise RuntimeError(
+            "Gemini did not return a valid cancellation price"
         )
 
-        data["confidence"] = confidence
+    # REQUIRED BY USER:
+    # cancellation must always be BELOW entry price.
+    if cancellation_price >= entry_price:
 
-        # ====================================================
-        # FORCE 2M
-        # ====================================================
-
-        timeframe = str(
-            data.get(
-                "timeframe",
-                ""
-            )
-        ).upper()
-
-        if not timeframe:
-
-            data["timeframe"] = "2M"
-
-        # ====================================================
-        # DEFAULT VALUES
-        # ====================================================
-
-        fields = [
-            "asset",
-            "chart_time",
-            "entry_time",
-            "entry_price",
-            "trend",
-            "short_trend",
-            "structure",
-            "keltner",
-            "adx",
-            "candle",
-            "reason",
-            "cancellation"
-        ]
-
-        for field in fields:
-
-            if not data.get(field):
-
-                data[field] = "غير واضح"
-
-        return data
-
-    except asyncio.TimeoutError:
-
-        raise ValueError(
-            "Gemini لم يكمل التحليل خلال 14 ثانية."
+        # Create a small logical distance
+        # while remaining below entry.
+        distance = max(
+            abs(entry_price) * 0.00015,
+            0.00001
         )
 
-    except Exception as e:
+        cancellation_price = (
+            entry_price - distance
+        )
 
-        error = str(e)
+    try:
+        delay = int(
+            data.get("entry_delay_minutes", 1)
+        )
+    except Exception:
+        delay = 1
 
-        if "504" in error:
+    delay = max(
+        1,
+        min(3, delay)
+    )
 
-            raise ValueError(
-                "Gemini 504: انتهت مهلة التحليل."
-            )
+    data["direction"] = direction
+    data["confidence"] = confidence
+    data["entry_price"] = entry_price
+    data["cancellation_price"] = cancellation_price
+    data["entry_delay_minutes"] = delay
 
-        if "503" in error:
-
-            raise ValueError(
-                "Gemini 503: الخدمة مشغولة حاليًا."
-            )
-
-        if "429" in error:
-
-            raise ValueError(
-                "Gemini 429: تم تجاوز حد الطلبات."
-            )
-
-        if "404" in error:
-
-            raise ValueError(
-                "Gemini 404: تحقق من توفر النموذج."
-            )
-
-        raise ValueError(error)
+    return data
 
 
 # ============================================================
@@ -918,217 +720,249 @@ async def analyze_image(image_bytes):
 
 def format_signal(data):
 
-    decision = str(
-        data.get(
-            "decision",
-            "UP"
-        )
-    ).upper()
+    direction = data["direction"]
 
-    if decision == "DOWN":
-
-        direction = "🔴 DOWN — بيع (Put)"
-
+    if direction == "UP":
+        emoji = "🟢"
+        label = "UP — شراء (Call)"
     else:
+        emoji = "🔴"
+        label = "DOWN — بيع (Put)"
 
-        direction = "🟢 UP — شراء (Call)"
-
-    confidence = data.get(
-        "confidence",
-        0
-    )
+    confidence = data["confidence"]
 
     asset = data.get(
         "asset",
-        "غير واضح"
+        "Unknown"
     )
 
     timeframe = data.get(
         "timeframe",
-        "2M"
+        TIMEFRAME
     )
 
-    chart_time = data.get(
-        "chart_time",
-        "غير واضح"
-    )
-
-    entry_time = data.get(
-        "entry_time",
-        "غير واضح"
-    )
-
-    entry_price = data.get(
-        "entry_price",
-        "غير واضح"
-    )
-
-    trend = data.get(
-        "trend",
-        "غير واضح"
+    general_trend = data.get(
+        "general_trend",
+        "Unknown"
     )
 
     short_trend = data.get(
         "short_trend",
-        "غير واضح"
+        "Unknown"
     )
 
     structure = data.get(
         "structure",
-        "غير واضح"
+        "Price structure analyzed"
     )
 
     keltner = data.get(
         "keltner",
-        "غير واضح"
+        "Keltner used as supporting factor"
     )
 
     adx = data.get(
         "adx",
-        "غير واضح"
+        "ADX used as supporting factor"
     )
 
     candle = data.get(
-        "candle",
-        "غير واضح"
+        "confirmation_candle",
+        "Candle confirmation analyzed"
     )
 
     reason = data.get(
         "reason",
-        "غير واضح"
+        "Multiple price-action factors are aligned"
     )
 
-    cancellation = data.get(
-        "cancellation",
-        "غير واضح"
+    entry_price = data["entry_price"]
+
+    cancellation_price = data[
+        "cancellation_price"
+    ]
+
+    delay = data[
+        "entry_delay_minutes"
+    ]
+
+    # Calculate future entry time
+    entry_time = (
+        now_user_time()
+        + timedelta(minutes=delay)
     )
 
-    return (
-
-        "🎓 تحليل زينو\n\n"
-
-        f"🎯 Confidence: {confidence}%\n"
-
-        f"📊 {asset} · ⏱ {timeframe}\n"
-
-        "━━━━━━━━━━━━━━\n\n"
-
-        f"🎯 القرار: {direction}\n"
-
-        f"🕐 وقت الشارت: {chart_time}\n"
-
-        f"⏰ وقت الدخول: {entry_time}\n"
-
-        f"💵 سعر الدخول: {entry_price}\n"
-
-        "━━━━━━━━━━━━━━\n\n"
-
-        f"📐 الاتجاه: {trend}\n"
-
-        f"📈 الاتجاه القصير: {short_trend}\n"
-
-        f"🏗 البنية السعرية: {structure}\n"
-
-        f"〽️ Keltner 20/10: {keltner}\n"
-
-        f"📊 ADX 14/14: {adx}\n"
-
-        f"🕯 شمعة التأكيد: {candle}\n"
-
-        "━━━━━━━━━━━━━━\n\n"
-
-        f"🧠 شرح زينو: {reason}\n\n"
-
-        f"🛑 شرط إلغاء الإشارة: {cancellation}\n"
-
-        "━━━━━━━━━━━━━━\n\n"
-
-        "⚠️ التحليل مبني على الشارت المرسل فقط."
+    # Force seconds to zero for clean display
+    entry_time = entry_time.replace(
+        second=0,
+        microsecond=0
     )
+
+    # Make sure future
+    if entry_time <= now_user_time():
+        entry_time += timedelta(
+            minutes=2
+        )
+
+    entry_time_text = (
+        entry_time.strftime("%H:%M:%S")
+        + " UTC-3"
+    )
+
+    chart_time = (
+        now_user_time()
+        .strftime("%H:%M:%S")
+        + " UTC-3"
+    )
+
+    message = f"""
+🎓 تحليل زينو
+
+🎯 Confidence: {confidence}%
+📊 {asset} · ⏱ {timeframe}
+━━━━━━━━━━━━━━
+
+🎯 القرار: {emoji} {label}
+🕐 وقت الشارت: {chart_time}
+⏰ وقت الدخول: {entry_time_text}
+💵 سعر الدخول: {entry_price:.8f}
+━━━━━━━━━━━━━━
+
+📐 الاتجاه: {general_trend}
+📈 الاتجاه القصير: {short_trend}
+🏗 البنية السعرية: {structure}
+〽️ Keltner 20/10: {keltner}
+📊 ADX 14/14: {adx}
+🕯 شمعة التأكيد: {candle}
+━━━━━━━━━━━━━━
+
+🧠 شرح زينو: {reason}
+
+🛑 إلغاء إذا أغلقت شمعة تحت {cancellation_price:.8f}
+
+━━━━━━━━━━━━━━
+⚠️ التحليل مبني على الشارت المرسل فقط.
+"""
+
+    return message.strip()
 
 
 # ============================================================
-# START
+# RESULT BUTTONS
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def result_keyboard():
 
-    if not is_owner(update):
-        return
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✅ WIN",
+                callback_data="trade_win"
+            ),
+            InlineKeyboardButton(
+                "❌ LOSS",
+                callback_data="trade_loss"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 الإحصائيات",
+                callback_data="trade_stats"
+            ),
+        ]
+    ]
 
-    await update.message.reply_text(
-
-        "🤖 ZINOSIGNASLQQ جاهز.\n\n"
-        "📸 أرسل صورة الشارت للتحليل."
-    )
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ============================================================
-# STATS
+# STATS TEXT
 # ============================================================
 
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def stats_text():
 
-    if not is_owner(update):
-        return
+    total = stats["total"]
+    wins = stats["wins"]
+    losses = stats["losses"]
 
-    total = wins + losses
-
-    if total:
-
+    if total > 0:
         winrate = (
             wins / total
         ) * 100
-
     else:
-
         winrate = 0
 
-    await update.message.reply_text(
-
-        "📊 إحصائيات التداول\n\n"
-
+    return (
+        "📊 إحصائيات زينو\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🎯 الصفقات: {total}\n"
         f"✅ WIN: {wins}\n"
-
         f"❌ LOSS: {losses}\n"
-
-        f"📌 TOTAL: {total}\n"
-
-        f"🎯 WIN RATE: {winrate:.1f}%"
+        f"📈 Win Rate: {winrate:.1f}%"
     )
 
 
 # ============================================================
-# RESET STATS
+# /START
 # ============================================================
 
-async def reset_stats(
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    global wins
-    global losses
-
     if not is_owner(update):
         return
 
-    wins = 0
-    losses = 0
-
     await update.message.reply_text(
-        "♻️ تم تصفير الإحصائيات."
+        "🎓 ZinoQuotexSignalAI\n\n"
+        "📸 أرسل صورة الشارت لتحليلها.\n\n"
+        "⏱ الإطار: 2M\n"
+        "🌍 التوقيت: UTC-3\n\n"
+        "استخدم /stats لعرض الإحصائيات."
     )
 
 
 # ============================================================
-# PHOTO HANDLER
+# /STATS
+# ============================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_owner(update):
+        return
+
+    await update.message.reply_text(
+        stats_text()
+    )
+
+
+# ============================================================
+# /RESET
+# ============================================================
+
+async def reset_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not is_owner(update):
+        return
+
+    stats["total"] = 0
+    stats["wins"] = 0
+    stats["losses"] = 0
+
+    await update.message.reply_text(
+        "♻️ تم تصفير إحصائيات الصفقات."
+    )
+
+
+# ============================================================
+# IMAGE HANDLER
 # ============================================================
 
 async def photo_handler(
@@ -1136,142 +970,134 @@ async def photo_handler(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    global last_signal
+
     if not is_owner(update):
         return
 
-    if not update.message:
+    if not update.message or not update.message.photo:
         return
 
-    if not update.message.photo:
-        return
-
-    status = await update.message.reply_text(
-        "🔎 تحليل سريع..."
+    status_message = await update.message.reply_text(
+        "🔎 جاري تحليل الشارت..."
     )
 
     try:
 
-        # أعلى جودة متاحة من Telegram
         photo = update.message.photo[-1]
 
-        telegram_file = await photo.get_file()
-
-        image_buffer = io.BytesIO()
-
-        await telegram_file.download_to_memory(
-            out=image_buffer
+        file = await context.bot.get_file(
+            photo.file_id
         )
 
-        image_bytes = image_buffer.getvalue()
+        import io
 
-        if not image_bytes:
+        image_bytes = await file.download_as_bytearray()
 
-            raise ValueError(
-                "الصورة فارغة"
-            )
-
-        data = await analyze_image(
-            image_bytes
+        image = Image.open(
+            io.BytesIO(image_bytes)
         )
 
-        signal = format_signal(
+        # Keep original quality/resolution
+        image.load()
+
+        # Convert safely
+        if image.mode not in (
+            "RGB",
+            "RGBA"
+        ):
+            image = image.convert("RGB")
+
+        data = analyze_image(image)
+
+        data = validate_analysis(data)
+
+        # Save latest signal
+        last_signal = data
+
+        signal_message = format_signal(
             data
         )
 
-        keyboard = InlineKeyboardMarkup(
-
-            [
-                [
-
-                    InlineKeyboardButton(
-                        "✅ WIN",
-                        callback_data="trade_win"
-                    ),
-
-                    InlineKeyboardButton(
-                        "❌ LOSS",
-                        callback_data="trade_loss"
-                    )
-
-                ]
-            ]
-        )
-
-        await status.edit_text(
-
-            signal,
-
-            reply_markup=keyboard
+        await status_message.edit_text(
+            signal_message,
+            reply_markup=result_keyboard()
         )
 
     except Exception as e:
 
+        logger.exception(
+            "Analysis error"
+        )
+
         error_text = str(e)
 
-        if len(error_text) > 1200:
+        # Keep Telegram message readable
+        if len(error_text) > 800:
+            error_text = error_text[:800]
 
-            error_text = error_text[:1200]
-
-        await status.edit_text(
-
-            "❌ فشل التحليل.\n\n"
-            f"{error_text}"
+        await status_message.edit_text(
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            + error_text
         )
 
 
 # ============================================================
-# BUTTONS
+# CALLBACK BUTTONS
 # ============================================================
 
-async def button_handler(
+async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    global wins
-    global losses
+    if not update.callback_query:
+        return
 
     query = update.callback_query
 
-    if not query:
-        return
-
-    if query.from_user.id != OWNER_ID:
-
-        await query.answer()
-
-        return
-
     await query.answer()
 
-    if query.data == "trade_win":
+    if not update.effective_user:
+        return
 
-        wins += 1
+    if update.effective_user.id != OWNER_ID:
+        return
 
-        await query.message.reply_text(
+    action = query.data
 
-            "✅ تم تسجيل WIN\n\n"
+    if action == "trade_win":
 
-            f"WIN: {wins}\n"
+        stats["total"] += 1
+        stats["wins"] += 1
 
-            f"LOSS: {losses}\n"
-
-            f"TOTAL: {wins + losses}"
+        await query.edit_message_reply_markup(
+            reply_markup=None
         )
 
-    elif query.data == "trade_loss":
+        await query.message.reply_text(
+            "✅ تم تسجيل WIN\n\n"
+            + stats_text()
+        )
 
-        losses += 1
+    elif action == "trade_loss":
+
+        stats["total"] += 1
+        stats["losses"] += 1
+
+        await query.edit_message_reply_markup(
+            reply_markup=None
+        )
 
         await query.message.reply_text(
-
             "❌ تم تسجيل LOSS\n\n"
+            + stats_text()
+        )
 
-            f"WIN: {wins}\n"
+    elif action == "trade_stats":
 
-            f"LOSS: {losses}\n"
-
-            f"TOTAL: {wins + losses}"
+        await query.message.reply_text(
+            stats_text()
         )
 
 
@@ -1280,13 +1106,15 @@ async def button_handler(
 # ============================================================
 
 async def error_handler(
-    update,
-    context
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    print(
-        "Telegram error:",
-        context.error
+    error = context.error
+
+    logger.error(
+        "Telegram error: %s",
+        error
     )
 
 
@@ -1296,41 +1124,52 @@ async def error_handler(
 
 def main():
 
+    start_health_server()
+
+    logger.info(
+        "ZinoQuotexSignalAI started."
+    )
+
+    logger.info(
+        "Gemini model: %s",
+        GEMINI_MODEL
+    )
+
     application = (
-
         ApplicationBuilder()
-
         .token(BOT_TOKEN)
-
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
         .build()
     )
 
     application.add_handler(
-
         CommandHandler(
             "start",
-            start
+            start_command
         )
     )
 
     application.add_handler(
-
         CommandHandler(
             "stats",
-            stats
+            stats_command
         )
     )
 
     application.add_handler(
-
         CommandHandler(
-            "resetstats",
-            reset_stats
+            "reset",
+            reset_command
         )
     )
 
     application.add_handler(
-
         MessageHandler(
             filters.PHOTO,
             photo_handler
@@ -1338,9 +1177,8 @@ def main():
     )
 
     application.add_handler(
-
         CallbackQueryHandler(
-            button_handler
+            callback_handler
         )
     )
 
@@ -1348,17 +1186,9 @@ def main():
         error_handler
     )
 
-    print(
-        "ZinoQuotexSignalAI started."
-    )
-
-    print(
-        "Gemini model:",
-        GEMINI_MODEL
-    )
-
     application.run_polling(
-        drop_pending_updates=True
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
     )
 
 
