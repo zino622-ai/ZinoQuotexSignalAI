@@ -1,14 +1,11 @@
 import os
-import io
 import json
+import asyncio
 import logging
-from datetime import datetime, timezone
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from datetime import datetime, timedelta, timezone
+from flask import Flask
+from threading import Thread
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,9 +19,9 @@ from google import genai
 from google.genai import types
 
 
-# =========================
-# CONFIG
-# =========================
+# =========================================================
+# SETTINGS
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -46,190 +43,239 @@ except ValueError:
     raise RuntimeError("OWNER_ID must be an integer")
 
 
-# =========================
+# =========================================================
 # LOGGING
-# =========================
+# =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger("ZinoAI")
+logger = logging.getLogger(__name__)
 
 
-# =========================
+# =========================================================
 # GEMINI
-# =========================
+# =========================================================
 
-gemini = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# =========================
-# SIMPLE MEMORY
-# =========================
+# =========================================================
+# STATS
+# =========================================================
 
-latest_chart = None
+wins = 0
+losses = 0
+
 last_signal = None
 
-stats = {
-    "win": 0,
-    "loss": 0,
-}
+
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
+app = Flask(__name__)
 
 
-# =========================
+@app.route("/")
+def home():
+    return "ZinoQuotexSignalAI is running", 200
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_server():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+
+# =========================================================
 # OWNER CHECK
-# =========================
+# =========================================================
 
 def is_owner(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and user.id == OWNER_ID)
 
-
-async def reject_non_owner(update: Update) -> bool:
-    if is_owner(update):
+    if not user:
         return False
 
-    if update.callback_query:
-        try:
-            await update.callback_query.answer(
-                "⛔ هذا البوت خاص بالمالك.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
-    elif update.effective_message:
-        await update.effective_message.reply_text(
-            "⛔ هذا البوت خاص بالمالك."
-        )
-
-    return True
+    return user.id == OWNER_ID
 
 
-# =========================
-# UI
-# =========================
-
-def signal_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎯 Get Signal", callback_data="get_signal")
-        ]
-    ])
+async def deny(update: Update):
+    if update.message:
+        await update.message.reply_text("⛔ هذا البوت خاص بالمالك فقط.")
 
 
-def result_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ WIN", callback_data="result_win"),
-            InlineKeyboardButton("❌ LOSS", callback_data="result_loss"),
-        ],
-        [
-            InlineKeyboardButton("🎯 Get Signal", callback_data="get_signal")
-        ]
-    ])
+# =========================================================
+# TIME
+# =========================================================
+
+UTC_MINUS_3 = timezone(timedelta(hours=-3))
 
 
-# =========================
-# START
-# =========================
+def get_entry_time(delay_minutes: int = 1) -> str:
+    now = datetime.now(UTC_MINUS_3)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_non_owner(update):
-        return
+    entry = now + timedelta(minutes=delay_minutes)
 
-    await update.message.reply_text(
-        "🤖 ZOYA AI STYLE\n\n"
-        "📸 أرسل Screenshot للشارت.\n"
-        "بعدها اضغط على Get Signal.",
-        reply_markup=signal_keyboard(),
-    )
+    entry = entry.replace(second=0, microsecond=0)
+
+    return entry.strftime("%H:%M")
 
 
-# =========================
-# IMAGE RECEIVER
-# =========================
+# =========================================================
+# GEMINI PROMPT
+# =========================================================
 
-async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global latest_chart
+SYSTEM_PROMPT = r"""
+You are Zino, a fast and disciplined Quotex chart analyst.
 
-    if await reject_non_owner(update):
-        return
+The user sends a screenshot of a Quotex trading chart.
 
-    photo = update.message.photo[-1]
-
-    file = await context.bot.get_file(photo.file_id)
-
-    buffer = io.BytesIO()
-    await file.download_to_memory(buffer)
-
-    latest_chart = buffer.getvalue()
-
-    await update.message.reply_text(
-        "📸 Chart received.\n\n"
-        "اضغط Get Signal لتحليل الشارت.",
-        reply_markup=signal_keyboard(),
-    )
-
-
-# =========================
-# GEMINI ANALYSIS
-# =========================
-
-ANALYSIS_PROMPT = r"""
-You are an AI binary-options chart signal analyzer.
-
-Analyze ONLY the chart screenshot supplied by the user.
-
-The desired behavior is the simple style of a high-confidence Quotex signal bot.
+Analyze ONLY what is actually visible in the screenshot.
 
 IMPORTANT:
-- Do NOT invent information that cannot be read from the screenshot.
-- Identify the visible trading asset/pair when possible.
-- Identify the visible chart timeframe when possible.
-- Analyze the visible price action and candle structure.
-- Look for ONE clear, high-confidence short-term setup.
-- Do not force a signal when the chart does not provide a sufficiently clear setup.
-- If there is no high-confidence setup, return NO_SIGNAL.
-- Do not add indicators that are not visible in the screenshot.
-- Do not claim a guaranteed win.
-- Confidence is an estimate, not a guarantee.
-- The signal must be either UP or DOWN.
-- Expiry should normally match the visible short-term chart context.
-- Entry should be the next suitable entry point visible from the chart.
-- Keep the final explanation short.
+- Always return a direction.
+- Never return NO SIGNAL.
+- Direction must be exactly UP or DOWN.
+- UP means CALL.
+- DOWN means PUT.
+- Do not randomly choose direction.
+- Do not make every signal UP.
+- Balance UP and DOWN according to the chart.
+- Do not invent indicators that are not visible.
+- Do not invent prices.
+- Preserve the visible asset/pair.
+- Detect the visible timeframe.
+- Main priority:
+  1. Candle open/close behavior
+  2. Recent highs and lows
+  3. Breakouts and confirmed candle closes
+  4. Market structure
+  5. Price Action
+  6. Momentum
+  7. Confirmation candle
+  8. Keltner Channel if visible
+  9. ADX / DI if visible
 
-Return ONLY valid JSON with exactly these keys:
+PRICE ACTION:
+- Look at the last closed candle, not an unfinished candle.
+- Pay attention to strong bullish/bearish closes.
+- Look for rejection wicks.
+- Look for engulfing candles.
+- Look for hammer / pin-bar behavior.
+- Look for breakouts confirmed by candle close.
+- Avoid treating a wick alone as a confirmed breakout.
+
+MARKET STRUCTURE:
+- Higher highs + higher lows generally support UP.
+- Lower highs + lower lows generally support DOWN.
+- Consolidation should be recognized as consolidation.
+- Near an important level, wait for confirmation from candle behavior.
+
+KELTNER:
+- If visible, use the Keltner Channel as confirmation.
+- Upper-band rejection can support DOWN.
+- Lower-band rejection can support UP.
+- Strong closes outside the channel can support continuation only when price action confirms it.
+
+ADX:
+- If visible, use ADX/DI only as supporting confirmation.
+- Positive DI can support UP.
+- Negative DI can support DOWN.
+- Do not let ADX alone decide the signal.
+
+ENTRY:
+- The entry should normally be at the beginning of the next suitable candle.
+- The entry delay can be 1 or 2 minutes depending on the chart.
+- Prefer 1 minute when the next candle is suitable.
+- Use 2 minutes when waiting for confirmation is more appropriate.
+- Do not use very long delays.
+- Never give an entry delay of many minutes or hours.
+
+CANCELLATION:
+- Give a cancellation price directly below the entry price.
+- The cancellation condition must be based on a meaningful nearby price level.
+- For UP, cancellation should normally be if a candle closes below the selected invalidation level.
+- For DOWN, cancellation should normally be if a candle closes above the selected invalidation level.
+- Do not use absurdly distant levels.
+- Do not output excessive decimal digits.
+- Use exactly 6 digits after the decimal when possible.
+- Example: 14.868390
+- The cancellation price must be usable on a Quotex chart.
+
+CONFIDENCE:
+- Confidence must be realistic.
+- Do not automatically use 80%, 90% or 95%.
+- Strong confirmed setups can receive higher confidence.
+- Weak setups should receive lower confidence.
+- The confidence should reflect the actual visible evidence.
+
+TIMEFRAME:
+- Read the timeframe from the screenshot when possible.
+- The user's Quotex chart may be 1M or 2M.
+- Do not force the timeframe to 2M if the screenshot clearly shows another timeframe.
+
+OUTPUT:
+Return ONLY valid JSON.
+No markdown.
+No explanation outside JSON.
+
+JSON schema:
 
 {
-  "status": "SIGNAL" or "NO_SIGNAL",
-  "asset": "string",
-  "timeframe": "string",
-  "direction": "UP" or "DOWN" or "",
-  "confidence": 0,
-  "expiry": "string",
-  "entry": "string",
-  "reason": "short string"
+  "asset": "USD/ZAR",
+  "timeframe": "2M",
+  "direction": "UP",
+  "confidence": 72,
+  "entry_delay": 2,
+  "entry_price": "14.868390",
+  "cancellation_price": "14.866500",
+  "trend": "Bullish",
+  "short_trend": "Bullish",
+  "market_structure": "Higher highs and higher lows",
+  "momentum": "Bullish",
+  "price_action": "Bullish confirmation candle",
+  "confirmation": "Bullish candle close",
+  "reason": "Price action and structure support continuation upward.",
+  "cancellation_condition": "إذا أغلقت شمعة تحت 14.866500"
 }
 
 Rules:
-- If status is NO_SIGNAL, direction must be "", confidence must be 0,
-  and expiry/entry can be "".
-- confidence must be an integer from 0 to 100.
-- Do not use markdown.
-- Do not wrap JSON in ```.
-
+- direction MUST be exactly "UP" or "DOWN".
+- confidence MUST be an integer from 1 to 100.
+- entry_delay MUST be 1 or 2.
+- entry_price must be a string.
+- cancellation_price must be a string.
+- cancellation_condition must match the direction.
+- Keep reason short.
+- JSON must be valid.
 """
 
 
-def clean_json(text: str):
+# =========================================================
+# JSON CLEANER
+# =========================================================
+
+def clean_json(text: str) -> dict:
     text = text.strip()
 
     if text.startswith("```"):
-        text = text.replace("```json", "", 1)
-        text = text.replace("```", "")
-        text = text.strip()
+        lines = text.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
 
     start = text.find("{")
     end = text.rfind("}")
@@ -237,214 +283,412 @@ def clean_json(text: str):
     if start == -1 or end == -1:
         raise ValueError("Gemini did not return JSON")
 
-    return json.loads(text[start:end + 1])
+    text = text[start:end + 1]
+
+    return json.loads(text)
 
 
-async def analyze_chart():
-    if not latest_chart:
-        raise ValueError("No chart screenshot available")
+# =========================================================
+# ANALYSIS
+# =========================================================
 
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(
-                data=latest_chart,
-                mime_type="image/jpeg",
+async def analyze_chart(image_bytes: bytes) -> dict:
+    prompt = """
+Analyze this Quotex chart screenshot according to the system instructions.
+
+Return ONLY valid JSON.
+
+Make the signal actionable:
+- UP or DOWN
+- confidence
+- asset
+- timeframe
+- entry delay 1 or 2 minutes
+- entry price
+- cancellation price
+- short technical reasoning
+
+Do not return NO SIGNAL.
+"""
+
+    response = await asyncio.wait_for(
+        asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg",
+                ),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.15,
+                response_mime_type="application/json",
             ),
-            ANALYSIS_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json",
         ),
+        timeout=25,
     )
 
-    data = clean_json(response.text)
+    if not response or not response.text:
+        raise ValueError("Empty Gemini response")
 
-    status = str(data.get("status", "")).upper()
+    result = clean_json(response.text)
 
-    if status not in {"SIGNAL", "NO_SIGNAL"}:
-        raise ValueError("Invalid signal status")
-
-    if status == "NO_SIGNAL":
-        return {
-            "status": "NO_SIGNAL",
-            "asset": data.get("asset", ""),
-            "timeframe": data.get("timeframe", ""),
-            "direction": "",
-            "confidence": 0,
-            "expiry": "",
-            "entry": "",
-            "reason": "",
-        }
-
-    direction = str(data.get("direction", "")).upper()
-
-    if direction not in {"UP", "DOWN"}:
-        raise ValueError("Invalid direction")
-
-    confidence = int(data.get("confidence", 0))
-
-    if confidence < 0 or confidence > 100:
-        raise ValueError("Invalid confidence")
-
-    return {
-        "status": "SIGNAL",
-        "asset": str(data.get("asset", "Unknown")),
-        "timeframe": str(data.get("timeframe", "Unknown")),
-        "direction": direction,
-        "confidence": confidence,
-        "expiry": str(data.get("expiry", "")),
-        "entry": str(data.get("entry", "")),
-        "reason": str(data.get("reason", "")),
-    }
+    return result
 
 
-# =========================
-# FORMAT
-# =========================
+# =========================================================
+# FORMAT PRICE
+# =========================================================
 
-def format_signal(data):
-    direction = data["direction"]
+def format_price(value) -> str:
+    try:
+        number = float(value)
 
-    if direction == "UP":
-        action = "🟢 BUY / UP"
-    else:
-        action = "🔴 SELL / DOWN"
+        # Quotex-friendly 6 decimal places
+        return f"{number:.6f}"
 
-    return (
-        "🎯 ZOYA AI SIGNAL\n\n"
-        f"{action}\n"
-        f"📊 {data['asset']} · ⏱ {data['timeframe']}\n\n"
-        f"🎯 Confidence: {data['confidence']}%\n"
-        f"⏳ Expiry: {data['expiry']}\n"
-        f"🕐 Entry: {data['entry']}\n\n"
-        f"📌 {data['reason']}"
-    )
+    except Exception:
+        return str(value)
 
 
-def format_no_signal(data):
-    return (
-        "❌ No high-confidence setup is available right now.\n\n"
-        "Please try again shortly."
-    )
+# =========================================================
+# FORMAT SIGNAL
+# =========================================================
 
-
-# =========================
-# GET SIGNAL
-# =========================
-
-async def get_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def format_signal(data: dict) -> str:
     global last_signal
 
-    query = update.callback_query
+    asset = str(data.get("asset", "UNKNOWN"))
+    timeframe = str(data.get("timeframe", "2M"))
 
-    if await reject_non_owner(update):
-        return
+    direction = str(data.get("direction", "UP")).upper()
 
-    await query.answer()
+    if direction not in ("UP", "DOWN"):
+        direction = "UP"
 
-    if not latest_chart:
-        await query.message.reply_text(
-            "📸 أرسل Screenshot للشارت أولاً."
-        )
-        return
-
-    await query.message.reply_text("🔎 Analyzing chart...")
+    confidence = int(data.get("confidence", 50))
 
     try:
-        data = await analyze_chart()
-        last_signal = data
+        confidence = max(1, min(100, confidence))
+    except Exception:
+        confidence = 50
 
-        if data["status"] == "NO_SIGNAL":
-            await query.message.reply_text(
-                format_no_signal(data),
-                reply_markup=signal_keyboard(),
-            )
-            return
+    try:
+        delay = int(data.get("entry_delay", 1))
+    except Exception:
+        delay = 1
 
-        await query.message.reply_text(
-            format_signal(data),
+    if delay not in (1, 2):
+        delay = 1
+
+    entry_price = format_price(data.get("entry_price", "0"))
+    cancellation_price = format_price(
+        data.get("cancellation_price", "0")
+    )
+
+    trend = str(data.get("trend", "N/A"))
+    short_trend = str(data.get("short_trend", "N/A"))
+    structure = str(data.get("market_structure", "N/A"))
+    momentum = str(data.get("momentum", "N/A"))
+    price_action = str(data.get("price_action", "N/A"))
+    confirmation = str(data.get("confirmation", "N/A"))
+    reason = str(data.get("reason", "N/A"))
+
+    entry_time = get_entry_time(delay)
+
+    if direction == "UP":
+        direction_text = "🟢 UP — CALL"
+        cancellation_text = (
+            f"🛑 إلغاء إذا أغلقت شمعة تحت {cancellation_price}"
+        )
+    else:
+        direction_text = "🔴 DOWN — PUT"
+        cancellation_text = (
+            f"🛑 إلغاء إذا أغلقت شمعة فوق {cancellation_price}"
+        )
+
+    signal = (
+        "🎓 تحليل زينو\n\n"
+        f"🎯 Confidence: {confidence}%\n"
+        f"📊 {asset} · ⏱ {timeframe}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"🎯 القرار: {direction_text}\n"
+        f"🕐 الدخول بعد: {delay} دقيقة\n"
+        f"⏰ وقت الدخول: {entry_time} UTC-3\n\n"
+        f"💵 سعر الدخول: {entry_price}\n"
+        f"{cancellation_text}\n\n"
+        "📈 التحليل\n"
+        f"• الاتجاه: {trend}\n"
+        f"• الاتجاه القصير: {short_trend}\n"
+        f"• Market Structure: {structure}\n"
+        f"• Momentum: {momentum}\n"
+        f"• Price Action: {price_action}\n"
+        f"• Confirmation: {confirmation}\n\n"
+        f"🧠 السبب: {reason}"
+    )
+
+    last_signal = {
+        "asset": asset,
+        "timeframe": timeframe,
+        "direction": direction,
+        "confidence": confidence,
+        "entry_time": entry_time,
+        "entry_price": entry_price,
+        "cancellation_price": cancellation_price,
+    }
+
+    return signal
+
+
+# =========================================================
+# WIN / LOSS KEYBOARD
+# =========================================================
+
+def result_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ WIN", callback_data="result_win"),
+            InlineKeyboardButton("❌ LOSS", callback_data="result_loss"),
+        ]
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await deny(update)
+        return
+
+    await update.message.reply_text(
+        "🎓 ZinoQuotexSignalAI\n\n"
+        "📸 أرسل Screenshot للشارت وسأحلله.\n\n"
+        "✅ /win — تسجيل صفقة رابحة\n"
+        "❌ /loss — تسجيل صفقة خاسرة\n"
+        "📊 /stats — الإحصائيات"
+    )
+
+
+# =========================================================
+# PHOTO HANDLER
+# =========================================================
+
+async def photo_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        await deny(update)
+        return
+
+    message = update.message
+
+    if not message or not message.photo:
+        return
+
+    status = await message.reply_text(
+        "🔎 جاري تحليل الشارت..."
+    )
+
+    try:
+        photo = message.photo[-1]
+
+        file = await context.bot.get_file(photo.file_id)
+
+        image_bytes = await file.download_as_bytearray()
+
+        result = await analyze_chart(bytes(image_bytes))
+
+        signal_text = format_signal(result)
+
+        await status.edit_text(
+            signal_text,
             reply_markup=result_keyboard(),
         )
 
-    except Exception as exc:
+    except asyncio.TimeoutError:
+        await status.edit_text(
+            "❌ انتهى وقت التحليل. أرسل الصورة مرة أخرى."
+        )
+
+    except Exception as e:
         logger.exception("Analysis error")
 
-        await query.message.reply_text(
-            f"❌ Analysis error:\n{exc}",
-            reply_markup=signal_keyboard(),
+        await status.edit_text(
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{str(e)[:1000]}"
         )
 
 
-# =========================
-# WIN / LOSS
-# =========================
+# =========================================================
+# BUTTON HANDLER
+# =========================================================
 
-async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global wins, losses
+
     query = update.callback_query
 
-    if await reject_non_owner(update):
+    if not query:
+        return
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ غير مصرح", show_alert=True)
         return
 
     await query.answer()
 
     if query.data == "result_win":
-        stats["win"] += 1
-        text = "✅ WIN recorded."
+        wins += 1
 
-    else:
-        stats["loss"] += 1
-        text = "❌ LOSS recorded."
+        await query.edit_message_reply_markup(
+            reply_markup=None
+        )
 
-    total = stats["win"] + stats["loss"]
+        await query.message.reply_text(
+            "✅ تم تسجيل WIN\n\n"
+            f"🏆 WIN: {wins}\n"
+            f"❌ LOSS: {losses}\n"
+            f"📊 المجموع: {wins + losses}\n"
+            f"🎯 نسبة النجاح: {win_rate()}%"
+        )
 
-    if total:
-        win_rate = (stats["win"] / total) * 100
-    else:
-        win_rate = 0
+    elif query.data == "result_loss":
+        losses += 1
 
-    await query.message.reply_text(
-        f"{text}\n\n"
-        f"WIN: {stats['win']}\n"
-        f"LOSS: {stats['loss']}\n"
-        f"Win Rate: {win_rate:.0f}%",
-        reply_markup=signal_keyboard(),
+        await query.edit_message_reply_markup(
+            reply_markup=None
+        )
+
+        await query.message.reply_text(
+            "❌ تم تسجيل LOSS\n\n"
+            f"🏆 WIN: {wins}\n"
+            f"❌ LOSS: {losses}\n"
+            f"📊 المجموع: {wins + losses}\n"
+            f"🎯 نسبة النجاح: {win_rate()}%"
+        )
+
+
+# =========================================================
+# WIN RATE
+# =========================================================
+
+def win_rate():
+    total = wins + losses
+
+    if total == 0:
+        return 0.0
+
+    return round((wins / total) * 100, 2)
+
+
+# =========================================================
+# /WIN
+# =========================================================
+
+async def win_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global wins
+
+    if not is_owner(update):
+        await deny(update)
+        return
+
+    wins += 1
+
+    await update.message.reply_text(
+        "✅ WIN مسجلة\n\n"
+        f"🏆 WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"📊 المجموع: {wins + losses}\n"
+        f"🎯 نسبة النجاح: {win_rate()}%"
     )
 
 
-# =========================
-# BUTTON ROUTER
-# =========================
+# =========================================================
+# /LOSS
+# =========================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def loss_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global losses
 
-    if query.data == "get_signal":
-        await get_signal(update, context)
+    if not is_owner(update):
+        await deny(update)
         return
 
-    if query.data in {"result_win", "result_loss"}:
-        await result_callback(update, context)
+    losses += 1
+
+    await update.message.reply_text(
+        "❌ LOSS مسجلة\n\n"
+        f"🏆 WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"📊 المجموع: {wins + losses}\n"
+        f"🎯 نسبة النجاح: {win_rate()}%"
+    )
+
+
+# =========================================================
+# /STATS
+# =========================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_owner(update):
+        await deny(update)
         return
 
+    total = wins + losses
 
-# =========================
+    await update.message.reply_text(
+        "📊 إحصائيات زينو\n\n"
+        f"🏆 WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"📈 المجموع: {total}\n"
+        f"🎯 نسبة النجاح: {win_rate()}%"
+    )
+
+
+# =========================================================
 # ERROR HANDLER
-# =========================
+# =========================================================
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     logger.exception(
-        "Unhandled exception",
+        "Telegram error",
         exc_info=context.error,
     )
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
+    Thread(
+        target=run_server,
+        daemon=True,
+    ).start()
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -456,23 +700,39 @@ def main():
     )
 
     application.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            receive_photo,
-        )
+        CommandHandler("win", win_command)
+    )
+
+    application.add_handler(
+        CommandHandler("loss", loss_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stats", stats_command)
     )
 
     application.add_handler(
         CallbackQueryHandler(button_handler)
     )
 
-    application.add_error_handler(error_handler)
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler,
+        )
+    )
 
-    logger.info("Zoya-style Zino AI bot is running")
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "ZinoQuotexSignalAI started | model=%s",
+        GEMINI_MODEL,
+    )
 
     application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
