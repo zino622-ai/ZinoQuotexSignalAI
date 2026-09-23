@@ -1,9 +1,12 @@
 import os
 import io
 import json
+import base64
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 import httpx
+from aiohttp import web
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -18,6 +21,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -26,6 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_RAW = os.getenv("OWNER_ID")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -342,11 +347,11 @@ RSI لا يقلب إشارة قوية بمفرده.
 
 UP:
 
-🛑 إلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
+إلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
 
 DOWN:
 
-🛑 إلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
+إلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
 
 المستوى يجب أن يكون مرتبطاً بـ swing أو structure مهم.
 
@@ -424,7 +429,7 @@ DOWN:
 
 
 # ============================================================
-# OWNER CHECK
+# OWNER
 # ============================================================
 
 def is_owner(update: Update) -> bool:
@@ -437,14 +442,17 @@ def is_owner(update: Update) -> bool:
 
 
 # ============================================================
-# GEMINI REQUEST
+# GEMINI
 # ============================================================
 
 async def analyze_image(image_bytes: bytes) -> dict:
+
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
     )
+
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
     payload = {
         "contents": [
@@ -456,9 +464,7 @@ async def analyze_image(image_bytes: bytes) -> dict:
                     {
                         "inline_data": {
                             "mime_type": "image/jpeg",
-                            "data": __import__("base64").b64encode(
-                                image_bytes
-                            ).decode("utf-8"),
+                            "data": image_base64,
                         }
                     }
                 ]
@@ -483,6 +489,7 @@ async def analyze_image(image_bytes: bytes) -> dict:
     )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
+
         response = await client.post(
             url,
             headers=headers,
@@ -490,12 +497,16 @@ async def analyze_image(image_bytes: bytes) -> dict:
         )
 
     if response.status_code != 200:
+
         try:
             error_data = response.json()
+
             message = (
-                error_data.get("error", {})
+                error_data
+                .get("error", {})
                 .get("message", response.text)
             )
+
         except Exception:
             message = response.text
 
@@ -506,30 +517,53 @@ async def analyze_image(image_bytes: bytes) -> dict:
     data = response.json()
 
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        text = (
+            data["candidates"][0]
+            ["content"]["parts"][0]["text"]
+        )
+
     except Exception:
-        raise RuntimeError("Gemini returned an empty response")
+
+        raise RuntimeError(
+            "Gemini returned an empty response"
+        )
 
     text = text.strip()
 
     if text.startswith("```"):
-        text = text.replace("```json", "")
-        text = text.replace("```", "")
+
+        text = text.replace(
+            "```json",
+            ""
+        )
+
+        text = text.replace(
+            "```",
+            ""
+        )
+
         text = text.strip()
 
     try:
+
         result = json.loads(text)
+
     except json.JSONDecodeError:
-        raise RuntimeError("Gemini returned invalid JSON")
+
+        raise RuntimeError(
+            "Gemini returned invalid JSON"
+        )
 
     return result
 
 
 # ============================================================
-# VALIDATE RESULT
+# VALIDATE
 # ============================================================
 
 def validate_signal(data: dict) -> dict:
+
     required = [
         "asset",
         "timeframe",
@@ -550,43 +584,78 @@ def validate_signal(data: dict) -> dict:
     ]
 
     for key in required:
+
         if key not in data:
+
             raise RuntimeError(
                 f"Gemini response missing: {key}"
             )
 
-    direction = str(data["direction"]).upper()
+    direction = str(
+        data["direction"]
+    ).upper()
 
     if direction not in ("UP", "DOWN"):
-        raise RuntimeError("Invalid direction")
+
+        raise RuntimeError(
+            "Invalid direction"
+        )
 
     try:
-        confidence = int(data["confidence"])
+
+        confidence = int(
+            data["confidence"]
+        )
+
     except Exception:
-        raise RuntimeError("Invalid confidence")
+
+        raise RuntimeError(
+            "Invalid confidence"
+        )
 
     if confidence < 0 or confidence > 100:
-        raise RuntimeError("Invalid confidence range")
+
+        raise RuntimeError(
+            "Invalid confidence range"
+        )
 
     try:
-        delay = int(data["entry_delay_minutes"])
+
+        delay = int(
+            data["entry_delay_minutes"]
+        )
+
     except Exception:
-        raise RuntimeError("Invalid entry delay")
+
+        raise RuntimeError(
+            "Invalid entry delay"
+        )
 
     if delay not in (1, 2, 3):
-        raise RuntimeError("Entry delay must be 1, 2 or 3 minutes")
 
-    rule = str(data["cancellation_rule"]).lower()
-
-    if direction == "UP" and rule != "close_below":
         raise RuntimeError(
-            "Invalid cancellation rule for UP"
+            "Entry delay must be 1, 2 or 3 minutes"
         )
 
-    if direction == "DOWN" and rule != "close_above":
-        raise RuntimeError(
-            "Invalid cancellation rule for DOWN"
-        )
+    rule = str(
+        data["cancellation_rule"]
+    ).lower()
+
+    if direction == "UP":
+
+        if rule != "close_below":
+
+            raise RuntimeError(
+                "Invalid cancellation rule for UP"
+            )
+
+    else:
+
+        if rule != "close_above":
+
+            raise RuntimeError(
+                "Invalid cancellation rule for DOWN"
+            )
 
     data["direction"] = direction
     data["confidence"] = confidence
@@ -601,50 +670,95 @@ def validate_signal(data: dict) -> dict:
 # ============================================================
 
 def format_signal(data: dict) -> str:
+
     direction = data["direction"]
 
     if direction == "UP":
+
         direction_text = "🟢 UP — شراء (Call)"
+
         cancel_text = (
             f"🛑 إلغاء إذا أغلقت شمعة تحت "
             f"{data['cancellation_level']}"
         )
+
         trend_emoji = "📈"
+
     else:
+
         direction_text = "🔴 DOWN — بيع (Put)"
+
         cancel_text = (
             f"🛑 إلغاء إذا أغلقت شمعة فوق "
             f"{data['cancellation_level']}"
         )
+
         trend_emoji = "📉"
 
-    now = datetime.now(UTC_MINUS_3)
-
-    entry_time = now + timedelta(
-        minutes=int(data["entry_delay_minutes"])
+    now = datetime.now(
+        UTC_MINUS_3
     )
 
-    entry_time_text = entry_time.strftime("%H:%M")
+    entry_time = now + timedelta(
+        minutes=int(
+            data["entry_delay_minutes"]
+        )
+    )
+
+    entry_time_text = entry_time.strftime(
+        "%H:%M"
+    )
 
     return (
         "🎓 تحليل زينو\n\n"
-        f"🎯 Confidence: {data['confidence']}%\n"
-        f"📊 {data['asset']} · ⏱ {data['timeframe']}\n"
+
+        f"🎯 Confidence: "
+        f"{data['confidence']}%\n"
+
+        f"📊 {data['asset']} · "
+        f"⏱ {data['timeframe']}\n"
+
         "━━━━━━━━━━━━━━\n\n"
-        f"🎯 القرار: {direction_text}\n"
-        f"🕐 وقت الدخول: {entry_time_text}\n"
-        f"⏳ بعد: {data['entry_delay_minutes']} دقيقة\n\n"
-        f"💵 سعر الدخول: {data['entry_price']}\n\n"
+
+        f"🎯 القرار: "
+        f"{direction_text}\n"
+
+        f"🕐 وقت الدخول: "
+        f"{entry_time_text}\n"
+
+        f"⏳ بعد: "
+        f"{data['entry_delay_minutes']} دقيقة\n\n"
+
+        f"💵 سعر الدخول: "
+        f"{data['entry_price']}\n\n"
+
         f"{cancel_text}\n"
+
         "━━━━━━━━━━━━━━\n\n"
-        f"{trend_emoji} الاتجاه: {data['trend']}\n"
-        f"🏗 Market Structure: {data['market_structure']}\n"
-        f"💨 Momentum: {data['momentum']}\n"
-        f"🕯 Confirmation: {data['confirmation']}\n"
-        f"📊 ADX/DMI: {data['adx_dmi']}\n"
-        f"〽️ Keltner: {data['keltner']}\n"
-        f"📉 RSI: {data['rsi']}\n\n"
-        f"🧠 السبب:\n{data['reason']}"
+
+        f"{trend_emoji} الاتجاه: "
+        f"{data['trend']}\n"
+
+        f"🏗 Market Structure: "
+        f"{data['market_structure']}\n"
+
+        f"💨 Momentum: "
+        f"{data['momentum']}\n"
+
+        f"🕯 Confirmation: "
+        f"{data['confirmation']}\n"
+
+        f"📊 ADX/DMI: "
+        f"{data['adx_dmi']}\n"
+
+        f"〽️ Keltner: "
+        f"{data['keltner']}\n"
+
+        f"📉 RSI: "
+        f"{data['rsi']}\n\n"
+
+        f"🧠 السبب:\n"
+        f"{data['reason']}"
     )
 
 
@@ -652,7 +766,11 @@ def format_signal(data: dict) -> str:
 # START
 # ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     if not is_owner(update):
         return
 
@@ -660,15 +778,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton(
                 "🎯 Get Signal",
-                callback_data="get_signal"
+                callback_data="get_signal",
             )
         ]
     ]
 
     await update.message.reply_text(
+
         "🎓 ZinoQuotexSignalAI\n\n"
-        "أرسل Screenshot للشارت ثم اضغط Get Signal.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+
+        "📸 أرسل Screenshot للشارت "
+        "ثم اضغط Get Signal.",
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
@@ -680,37 +804,51 @@ async def handle_photo(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not is_owner(update):
         return
 
-    if not update.message or not update.message.photo:
+    if not update.message:
+        return
+
+    if not update.message.photo:
         return
 
     photo = update.message.photo[-1]
 
-    file = await context.bot.get_file(photo.file_id)
+    file = await context.bot.get_file(
+        photo.file_id
+    )
 
     image_buffer = io.BytesIO()
 
-    await file.download_to_memory(image_buffer)
+    await file.download_to_memory(
+        image_buffer
+    )
 
     image_buffer.seek(0)
 
-    context.user_data["chart_image"] = image_buffer.getvalue()
+    context.user_data["chart_image"] = (
+        image_buffer.getvalue()
+    )
 
     keyboard = [
         [
             InlineKeyboardButton(
                 "🎯 Get Signal",
-                callback_data="get_signal"
+                callback_data="get_signal",
             )
         ]
     ]
 
     await update.message.reply_text(
+
         "✅ تم استلام الشارت.\n\n"
         "اضغط Get Signal للتحليل.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
@@ -722,55 +860,80 @@ async def get_signal(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     query = update.callback_query
 
     if not query:
         return
 
     if query.from_user.id != OWNER_ID:
+
         await query.answer()
+
         return
 
     await query.answer()
 
-    image_bytes = context.user_data.get("chart_image")
+    image_bytes = context.user_data.get(
+        "chart_image"
+    )
 
     if not image_bytes:
+
         await query.message.reply_text(
             "❌ أرسل Screenshot للشارت أولاً."
         )
+
         return
 
-    processing_message = await query.message.reply_text(
-        "🔎 جاري تحليل الشارت..."
+    processing_message = (
+        await query.message.reply_text(
+            "🔎 جاري تحليل الشارت..."
+        )
     )
 
     try:
-        result = await analyze_image(image_bytes)
 
-        result = validate_signal(result)
+        result = await analyze_image(
+            image_bytes
+        )
 
-        signal_text = format_signal(result)
+        result = validate_signal(
+            result
+        )
+
+        signal_text = format_signal(
+            result
+        )
 
         keyboard = [
             [
                 InlineKeyboardButton(
                     "🎯 Get Signal",
-                    callback_data="get_signal"
+                    callback_data="get_signal",
                 )
             ]
         ]
 
         await processing_message.edit_text(
+
             signal_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            ),
         )
 
     except Exception as e:
-        logger.exception("Analysis error")
+
+        logger.exception(
+            "Analysis error"
+        )
 
         await processing_message.edit_text(
-            f"❌ حدث خطأ أثناء التحليل:\n\n{str(e)}"
+
+            f"❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{str(e)}"
         )
 
 
@@ -782,6 +945,7 @@ async def handle_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not is_owner(update):
         return
 
@@ -794,10 +958,55 @@ async def handle_text(
 
 
 # ============================================================
+# RENDER HEALTH SERVER
+# ============================================================
+
+async def health(request):
+
+    return web.Response(
+        text="ZinoQuotexSignalAI is running"
+    )
+
+
+async def start_health_server():
+
+    app = web.Application()
+
+    app.router.add_get(
+        "/",
+        health
+    )
+
+    app.router.add_get(
+        "/health",
+        health
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=PORT,
+    )
+
+    await site.start()
+
+    logger.info(
+        f"HTTP server started on port {PORT}"
+    )
+
+    return runner
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
-def main():
+async def main():
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -805,38 +1014,72 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
         CallbackQueryHandler(
             get_signal,
-            pattern="^get_signal$"
+            pattern="^get_signal$",
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            handle_photo
+            handle_photo,
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_text
+            handle_text,
         )
     )
 
-    logger.info(
-        "ZinoQuotexSignalAI started successfully"
+    health_runner = (
+        await start_health_server()
     )
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    try:
+
+        await application.initialize()
+
+        await application.start()
+
+        await application.updater.start_polling(
+            drop_pending_updates=True
+        )
+
+        logger.info(
+            "ZinoQuotexSignalAI started successfully"
+        )
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        await application.updater.stop()
+
+        await application.stop()
+
+        await application.shutdown()
+
+        await health_runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Bot stopped"
+)
