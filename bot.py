@@ -3,22 +3,28 @@ import io
 import json
 import asyncio
 import logging
+import base64
 from datetime import datetime, timedelta, timezone
 import httpx
 import matplotlib
+
 matplotlib.use("Agg")
-importtlib matplotlib.pyplot as pfro
+
+import matplotlib.pyplot as plt
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
+
 
 # ============================================================
 # CONFIG
@@ -31,6 +37,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -46,6 +53,7 @@ if not GEMINI_MODEL:
 
 if not TWELVE_DATA_API_KEY:
     raise RuntimeError("TWELVE_DATA_API_KEY is missing")
+
 
 try:
     OWNER_ID = int(OWNER_ID_RAW)
@@ -66,14 +74,14 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# TIMEZONE
+# TIMEZONE UTC-3
 # ============================================================
 
 UTC_MINUS_3 = timezone(timedelta(hours=-3))
 
 
 # ============================================================
-# PAIRS TO SCAN
+# FOREX PAIRS
 # ============================================================
 
 PAIRS = [
@@ -99,13 +107,14 @@ PAIRS = [
 ANALYSIS_PROMPT = r"""
 أنت محلل تقني متخصص في التداول قصير المدى.
 
-حلل صورة الشارت المرفقة للزوج الذي تم اختياره مسبقاً.
+حلل صورة الشارت المرفقة للزوج المختار.
 
-أعطِ اتجاهًا واحدًا فقط:
+يجب إعطاء اتجاه واحد فقط:
 
-UP أو DOWN.
+UP أو DOWN
 
-لا تستخدم:
+ممنوع:
+
 NO SIGNAL
 WAIT
 
@@ -131,7 +140,7 @@ Open
 Close
 High
 Low
-حجم الجسم
+حجم جسم الشمعة
 الظلال
 القمم
 القيعان
@@ -140,6 +149,8 @@ Low
 Higher High + Higher Low = Bullish.
 
 Lower High + Lower Low = Bearish.
+
+ركز على الشموع المغلقة وليس الشمعة التي مازالت تتكون.
 
 ━━━━━━━━━━━━━━━━━━
 MARKET STRUCTURE
@@ -177,22 +188,18 @@ Bearish Rejection
 Strong Bearish Close
 Breakdown Candle
 
-ركز على الشموع المغلقة.
-
 ━━━━━━━━━━━━━━━━━━
 ADX + DMI
 ━━━━━━━━━━━━━━━━━━
-
-ADX يقيس قوة الاتجاه.
 
 ADX أقل من 20:
 اتجاه ضعيف.
 
 ADX فوق 20:
-اتجاه محتمل.
+يوجد احتمال اتجاه.
 
 ADX فوق 25:
-قوة أعلى.
+قوة اتجاه أعلى.
 
 +DI > -DI:
 يدعم UP.
@@ -209,10 +216,10 @@ KELTNER
 استخدم Keltner كفلتر.
 
 UP:
-السعر فوق Middle Band مع momentum صاعد.
+السعر فوق Middle Band مع Momentum صاعد.
 
 DOWN:
-السعر تحت Middle Band مع momentum هابط.
+السعر تحت Middle Band مع Momentum هابط.
 
 لا تعكس الاتجاه فقط بسبب لمس Upper أو Lower Band.
 
@@ -234,17 +241,22 @@ Oversold محتمل.
 ENTRY DELAY
 ━━━━━━━━━━━━━━━━━━
 
-اختر:
+اختر فقط:
 
 1
 2
-أو 3 دقائق.
+3
 
-1 دقيقة عندما يكون الاتجاه واضحاً.
+دقائق.
 
-2 دقيقة عند الحاجة إلى confirmation.
+1 دقيقة:
+عندما يكون الاتجاه واضحًا جدًا.
 
-3 دقائق إذا كان السعر عند structure مهم ويحتاج شمعة إضافية.
+2 دقيقة:
+عندما يحتاج التحليل Confirmation إضافي.
+
+3 دقائق:
+عندما يكون السعر عند Structure مهم ويحتاج شمعة إضافية.
 
 ━━━━━━━━━━━━━━━━━━
 CANCELLATION
@@ -258,7 +270,9 @@ DOWN:
 
 close_above
 
-يجب أن يكون المستوى قريباً من structure مهم وليس رقماً عشوائياً.
+يجب أن يكون Cancellation Level قريبًا من Structure مهم.
+
+لا تضع رقمًا عشوائيًا.
 
 ━━━━━━━━━━━━━━━━━━
 CONFIDENCE
@@ -272,9 +286,9 @@ CONFIDENCE
 
 80-89 توافق قوي.
 
-90+ فقط في حالة استثنائية.
+90+ نادر جدًا.
 
-لا تستخدم 100%.
+ممنوع 100%.
 
 ━━━━━━━━━━━━━━━━━━
 OUTPUT
@@ -307,11 +321,10 @@ JSON فقط:
 
 
 # ============================================================
-# OWNER
+# OWNER CHECK
 # ============================================================
 
 def is_owner(update: Update) -> bool:
-
     user = update.effective_user
 
     if not user:
@@ -321,7 +334,7 @@ def is_owner(update: Update) -> bool:
 
 
 # ============================================================
-# HTTP REQUEST
+# TWELVE DATA REQUEST
 # ============================================================
 
 async def twelve_data_request(
@@ -331,9 +344,8 @@ async def twelve_data_request(
 
     url = f"https://api.twelvedata.com/{endpoint}"
 
-    params = dict(params)
-
-    params["apikey"] = TWELVE_DATA_API_KEY
+    request_params = dict(params)
+    request_params["apikey"] = TWELVE_DATA_API_KEY
 
     timeout = httpx.Timeout(
         connect=15.0,
@@ -348,23 +360,26 @@ async def twelve_data_request(
 
         response = await client.get(
             url,
-            params=params,
+            params=request_params,
         )
 
     if response.status_code != 200:
-
         raise RuntimeError(
             f"Twelve Data HTTP {response.status_code}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        raise RuntimeError(
+            "Twelve Data returned invalid JSON"
+        )
 
     if data.get("status") == "error":
-
         raise RuntimeError(
             data.get(
                 "message",
-                "Twelve Data error"
+                "Twelve Data error",
             )
         )
 
@@ -372,7 +387,7 @@ async def twelve_data_request(
 
 
 # ============================================================
-# GET CANDLES
+# GET 1M CANDLES
 # ============================================================
 
 async def get_candles(
@@ -393,7 +408,6 @@ async def get_candles(
     values = data.get("values")
 
     if not values:
-
         raise RuntimeError(
             f"No candle data for {symbol}"
         )
@@ -418,7 +432,6 @@ async def get_candles(
             continue
 
     if len(candles) < 30:
-
         raise RuntimeError(
             f"Not enough candles for {symbol}"
         )
@@ -427,7 +440,7 @@ async def get_candles(
 
 
 # ============================================================
-# 2 MINUTE AGGREGATION
+# AGGREGATE 1M -> 2M
 # ============================================================
 
 def aggregate_2m(
@@ -435,7 +448,6 @@ def aggregate_2m(
 ) -> list:
 
     result = []
-
     bucket = []
 
     for candle in candles:
@@ -466,10 +478,13 @@ def aggregate_2m(
 
 
 # ============================================================
-# TECHNICAL HELPERS
+# EMA
 # ============================================================
 
-def ema(values: list, period: int) -> list:
+def ema(
+    values: list,
+    period: int,
+) -> list:
 
     if not values:
         return []
@@ -493,10 +508,15 @@ def ema(values: list, period: int) -> list:
     return result
 
 
-def true_ranges(candles: list) -> list:
+# ============================================================
+# TRUE RANGE
+# ============================================================
+
+def true_ranges(
+    candles: list,
+) -> list:
 
     result = []
-
     previous_close = None
 
     for candle in candles:
@@ -512,8 +532,12 @@ def true_ranges(candles: list) -> list:
 
             tr = max(
                 high - low,
-                abs(high - previous_close),
-                abs(low - previous_close),
+                abs(
+                    high - previous_close
+                ),
+                abs(
+                    low - previous_close
+                ),
             )
 
         result.append(tr)
@@ -522,6 +546,10 @@ def true_ranges(candles: list) -> list:
 
     return result
 
+
+# ============================================================
+# ATR
+# ============================================================
 
 def calculate_atr(
     candles: list,
@@ -533,10 +561,15 @@ def calculate_atr(
     if len(trs) < period:
         return 0.0
 
-    return sum(
-        trs[-period:]
-    ) / period
+    return (
+        sum(trs[-period:])
+        / period
+    )
 
+
+# ============================================================
+# RSI
+# ============================================================
 
 def calculate_rsi(
     candles: list,
@@ -557,7 +590,8 @@ def calculate_rsi(
     for i in range(1, len(closes)):
 
         change = (
-            closes[i] - closes[i - 1]
+            closes[i]
+            - closes[i - 1]
         )
 
         gains.append(
@@ -568,13 +602,15 @@ def calculate_rsi(
             max(-change, 0)
         )
 
-    avg_gain = sum(
-        gains[-period:]
-    ) / period
+    avg_gain = (
+        sum(gains[-period:])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[-period:]
-    ) / period
+    avg_loss = (
+        sum(losses[-period:])
+        / period
+    )
 
     if avg_loss == 0:
         return 100.0
@@ -587,7 +623,7 @@ def calculate_rsi(
 
 
 # ============================================================
-# SIMPLE ADX / DMI
+# ADX + DMI
 # ============================================================
 
 def calculate_dmi(
@@ -596,14 +632,16 @@ def calculate_dmi(
 ):
 
     if len(candles) < period + 2:
-
         return 0.0, 0.0, 0.0
 
     trs = []
     plus_dm = []
     minus_dm = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles),
+    ):
 
         current = candles[i]
         previous = candles[i - 1]
@@ -665,7 +703,9 @@ def calculate_dmi(
     plus_di = (
         100
         * (
-            sum(plus_dm[-period:])
+            sum(
+                plus_dm[-period:]
+            )
             / period
         )
         / atr
@@ -674,14 +714,17 @@ def calculate_dmi(
     minus_di = (
         100
         * (
-            sum(minus_dm[-period:])
+            sum(
+                minus_dm[-period:]
+            )
             / period
         )
         / atr
     )
 
     denominator = (
-        plus_di + minus_di
+        plus_di
+        + minus_di
     )
 
     if denominator == 0:
@@ -692,16 +735,21 @@ def calculate_dmi(
         adx = (
             100
             * abs(
-                plus_di - minus_di
+                plus_di
+                - minus_di
             )
             / denominator
         )
 
-    return adx, plus_di, minus_di
+    return (
+        adx,
+        plus_di,
+        minus_di,
+    )
 
 
 # ============================================================
-# KELTNER
+# KELTNER CHANNEL
 # ============================================================
 
 def calculate_keltner(
@@ -718,26 +766,30 @@ def calculate_keltner(
         20,
     )[-1]
 
-    atr = calculate_atr(
+    atr10 = calculate_atr(
         candles,
         10,
     )
 
     upper = (
         ema20
-        + (2 * atr)
+        + (2 * atr10)
     )
 
     lower = (
         ema20
-        - (2 * atr)
+        - (2 * atr10)
     )
 
-    return ema20, upper, lower
+    return (
+        ema20,
+        upper,
+        lower,
+    )
 
 
 # ============================================================
-# SCORE ONE PAIR
+# SCORE PAIR
 # ============================================================
 
 def score_pair(
@@ -745,7 +797,6 @@ def score_pair(
 ):
 
     if len(candles_1m) < 40:
-
         return None
 
     candles_2m = aggregate_2m(
@@ -753,18 +804,17 @@ def score_pair(
     )
 
     if len(candles_2m) < 25:
-
         return None
 
     score_up = 0
     score_down = 0
 
-    # --------------------------------------------------------
-    # PRICE ACTION
-    # --------------------------------------------------------
-
     last = candles_2m[-1]
     previous = candles_2m[-2]
+
+    # ========================================================
+    # PRICE ACTION
+    # ========================================================
 
     body = (
         last["close"]
@@ -794,12 +844,13 @@ def score_pair(
 
         if body > 0:
             score_up += 2
+
         else:
             score_down += 2
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
+    # ========================================================
+    # MARKET STRUCTURE
+    # ========================================================
 
     recent = candles_2m[-8:]
 
@@ -827,9 +878,9 @@ def score_pair(
 
         score_down += 3
 
-    # --------------------------------------------------------
+    # ========================================================
     # BREAKOUT
-    # --------------------------------------------------------
+    # ========================================================
 
     previous_high = max(
         c["high"]
@@ -842,22 +893,18 @@ def score_pair(
     )
 
     if last["close"] > previous_high:
-
         score_up += 3
 
     if last["close"] < previous_low:
-
         score_down += 3
 
-    # --------------------------------------------------------
+    # ========================================================
     # ADX + DMI
-    # --------------------------------------------------------
+    # ========================================================
 
-    adx, plus_di, minus_di = (
-        calculate_dmi(
-            candles_2m,
-            14,
-        )
+    adx, plus_di, minus_di = calculate_dmi(
+        candles_2m,
+        14,
     )
 
     if adx >= 20:
@@ -876,27 +923,23 @@ def score_pair(
         elif minus_di > plus_di:
             score_down += 1
 
-    # --------------------------------------------------------
+    # ========================================================
     # KELTNER
-    # --------------------------------------------------------
+    # ========================================================
 
-    middle, upper, lower = (
-        calculate_keltner(
-            candles_2m
-        )
+    middle, upper, lower = calculate_keltner(
+        candles_2m
     )
 
     if last["close"] > middle:
-
         score_up += 2
 
     elif last["close"] < middle:
-
         score_down += 2
 
-    # --------------------------------------------------------
+    # ========================================================
     # RSI
-    # --------------------------------------------------------
+    # ========================================================
 
     rsi = calculate_rsi(
         candles_2m,
@@ -904,16 +947,14 @@ def score_pair(
     )
 
     if 52 <= rsi <= 68:
-
         score_up += 1
 
     elif 32 <= rsi <= 48:
-
         score_down += 1
 
-    # --------------------------------------------------------
+    # ========================================================
     # MOMENTUM
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         last["close"]
@@ -930,7 +971,8 @@ def score_pair(
         score_down += 1
 
     difference = abs(
-        score_up - score_down
+        score_up
+        - score_down
     )
 
     total = (
@@ -941,11 +983,10 @@ def score_pair(
     if total == 0:
         return None
 
-    direction = (
-        "UP"
-        if score_up >= score_down
-        else "DOWN"
-    )
+    if score_up >= score_down:
+        direction = "UP"
+    else:
+        direction = "DOWN"
 
     confidence = int(
         min(
@@ -958,7 +999,6 @@ def score_pair(
         )
     )
 
-    # Need meaningful edge
     if difference < 3:
         confidence = min(
             confidence,
@@ -984,7 +1024,7 @@ def score_pair(
 
 
 # ============================================================
-# SCAN PAIRS
+# SCAN ALL PAIRS
 # ============================================================
 
 async def scan_pairs():
@@ -1077,7 +1117,28 @@ async def scan_pairs():
 
 
 # ============================================================
-# CREATE CHART
+# PRICE FORMAT
+# ============================================================
+
+def format_price(value) -> str:
+
+    try:
+
+        number = float(value)
+
+    except Exception:
+
+        return str(value)
+
+    text = f"{number:.6f}"
+
+    text = text.rstrip("0").rstrip(".")
+
+    return text
+
+
+# ============================================================
+# CREATE CANDLE CHART
 # ============================================================
 
 def create_chart(
@@ -1087,13 +1148,13 @@ def create_chart(
 
     candles = candles[-60:]
 
-    closes = [
-        c["close"]
+    opens = [
+        c["open"]
         for c in candles
     ]
 
-    opens = [
-        c["open"]
+    closes = [
+        c["close"]
         for c in candles
     ]
 
@@ -1164,7 +1225,7 @@ def create_chart(
     )
 
     ax.set_xlabel(
-        "1-minute candles"
+        "2-minute candles"
     )
 
     ax.set_ylabel(
@@ -1202,13 +1263,9 @@ async def analyze_chart(
     timeframe: str,
 ) -> dict:
 
-    import base64
-
-    image_base64 = (
-        base64.b64encode(
-            image_bytes
-        ).decode("utf-8")
-    )
+    image_base64 = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
 
     prompt = (
         ANALYSIS_PROMPT
@@ -1333,7 +1390,7 @@ async def analyze_chart(
 
 
 # ============================================================
-# VALIDATE
+# VALIDATE SIGNAL
 # ============================================================
 
 def validate_signal(
@@ -1383,9 +1440,17 @@ def validate_signal(
             "Invalid direction"
         )
 
-    confidence = int(
-        data["confidence"]
-    )
+    try:
+
+        confidence = int(
+            data["confidence"]
+        )
+
+    except Exception:
+
+        raise RuntimeError(
+            "Invalid confidence"
+        )
 
     if not 0 <= confidence <= 100:
 
@@ -1393,9 +1458,17 @@ def validate_signal(
             "Invalid confidence"
         )
 
-    delay = int(
-        data["entry_delay_minutes"]
-    )
+    try:
+
+        delay = int(
+            data["entry_delay_minutes"]
+        )
+
+    except Exception:
+
+        raise RuntimeError(
+            "Invalid entry delay"
+        )
 
     if delay not in (
         1,
@@ -1431,6 +1504,14 @@ def validate_signal(
     data["confidence"] = confidence
     data["entry_delay_minutes"] = delay
     data["cancellation_rule"] = rule
+
+    data["entry_price"] = format_price(
+        data["entry_price"]
+    )
+
+    data["cancellation_level"] = format_price(
+        data["cancellation_level"]
+    )
 
     return data
 
@@ -1486,10 +1567,8 @@ def format_signal(
         )
     )
 
-    entry_time_text = (
-        entry_time.strftime(
-            "%H:%M"
-        )
+    entry_time_text = entry_time.strftime(
+        "%H:%M"
     )
 
     return (
@@ -1566,12 +1645,14 @@ async def start(
         ]
     ]
 
-    await update.message.reply_text(
-        "🎯 اضغط Get Signal",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
-    )
+    if update.message:
+
+        await update.message.reply_text(
+            "🎯 اضغط Get Signal",
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            ),
+        )
 
 
 # ============================================================
@@ -1596,25 +1677,21 @@ async def get_signal(
 
     await query.answer()
 
-    processing = (
-        await query.message.reply_text(
-            "🔎 جاري فحص الأزواج..."
-        )
+    processing = await query.message.reply_text(
+        "🔎 جاري فحص الأزواج..."
     )
 
     try:
 
         # ----------------------------------------------------
-        # 1. SCAN
+        # 1. SCAN ALL PAIRS
         # ----------------------------------------------------
 
         best = await scan_pairs()
 
         asset = best["asset"]
 
-        candles_2m = best[
-            "candles_2m"
-        ]
+        candles_2m = best["candles_2m"]
 
         # ----------------------------------------------------
         # 2. CREATE CHART
@@ -1626,7 +1703,7 @@ async def get_signal(
         )
 
         # ----------------------------------------------------
-        # 3. SEND CHART FIRST
+        # 3. SEND CHART
         # ----------------------------------------------------
 
         await query.message.reply_photo(
@@ -1635,13 +1712,13 @@ async def get_signal(
             ),
             caption=(
                 f"📊 {asset}\n"
-                f"🔎 تم اختيار أفضل زوج "
-                f"بعد فحص الأزواج."
+                "🔎 تم اختيار أفضل زوج "
+                "بعد فحص الأزواج."
             ),
         )
 
         # ----------------------------------------------------
-        # 4. GEMINI ANALYSIS
+        # 4. GEMINI
         # ----------------------------------------------------
 
         await processing.edit_text(
@@ -1660,7 +1737,7 @@ async def get_signal(
         )
 
         # ----------------------------------------------------
-        # 5. SEND SIGNAL
+        # 5. SIGNAL
         # ----------------------------------------------------
 
         keyboard = [
@@ -1685,28 +1762,30 @@ async def get_signal(
             "Get Signal error"
         )
 
-        await processing.edit_text(
-            "❌ حدث خطأ:\n\n"
-            f"{str(exc)}"
-        )
+        try:
+
+            await processing.edit_text(
+                "❌ حدث خطأ:\n\n"
+                f"{str(exc)}"
+            )
+
+        except Exception:
+
+            pass
 
 
 # ============================================================
-# HEALTH SERVER
+# HEALTH SERVER FOR RENDER
 # ============================================================
 
 async def health_server():
 
     from aiohttp import web
 
-    async def health(
-        request,
-    ):
+    async def health(request):
 
         return web.Response(
-            text=(
-                "ZinoQuotexSignalAI is running"
-            )
+            text="ZinoQuotexSignalAI is running"
         )
 
     app = web.Application()
@@ -1736,7 +1815,7 @@ async def health_server():
     await site.start()
 
     logger.info(
-        "Health server running on %s",
+        "Health server running on port %s",
         PORT,
     )
 
@@ -1782,7 +1861,7 @@ async def main():
         )
 
         logger.info(
-            "ZinoQuotexSignalAI started"
+            "ZinoQuotexSignalAI started successfully"
         )
 
         await asyncio.Event().wait()
