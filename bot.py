@@ -22,8 +22,8 @@ Application,
 CommandHandler,
 CallbackQueryHandler,
 ContextTypes,
-filters,
 MessageHandler,
+filters,
 )
 
 ============================================================
@@ -83,7 +83,7 @@ UTC_MINUS_3 = timezone(timedelta(hours=-3))
 
 ============================================================
 
-DATA
+FOREX PAIRS
 
 ============================================================
 
@@ -104,7 +104,7 @@ FOREX_PAIRS = [
 
 ============================================================
 
-GEMINI
+GEMINI CLIENT
 
 ============================================================
 
@@ -128,30 +128,25 @@ return user.id == OWNER_ID
 
 ============================================================
 
-PRICE FORMATTING
+PRICE FORMAT
 
 ============================================================
 
 def format_price(price: float) -> str:
-"""
-Keep price readable and usable on the trading platform.
-Maximum 6 decimal places.
-"""
-
 if price >= 100:
-    decimals = 3
+decimals = 3
 elif price >= 10:
-    decimals = 4
+decimals = 4
 elif price >= 1:
-    decimals = 5
+decimals = 5
 else:
-    decimals = 6
+decimals = 6
 
 return f"{price:.{decimals}f}"
 
 ============================================================
 
-FETCH TWELVE DATA
+TWELVE DATA
 
 ============================================================
 
@@ -160,10 +155,6 @@ client: httpx.AsyncClient,
 symbol: str,
 outputsize: int = 80,
 ):
-"""
-Fetch 1-minute OHLC data from Twelve Data.
-"""
-
 url = "https://api.twelvedata.com/time_series"
 
 params = {
@@ -268,18 +259,20 @@ except Exception as e:
 
 ============================================================
 
-2-MINUTE AGGREGATION
+2 MINUTE CANDLES
 
 ============================================================
 
 def make_2m_candles(df: pd.DataFrame):
-"""
-Convert 1-minute candles into 2-minute candles.
-"""
-
 work = df.copy()
 
-work = work.set_index("datetime")
+work["datetime"] = pd.to_datetime(
+    work["datetime"]
+)
+
+work = work.set_index(
+    "datetime"
+)
 
 result = (
     work.resample("2min")
@@ -299,7 +292,7 @@ return result
 
 ============================================================
 
-TECHNICAL CALCULATIONS
+ATR
 
 ============================================================
 
@@ -309,24 +302,39 @@ period: int = 10,
 ):
 previous_close = df["close"].shift(1)
 
-tr1 = df["high"] - df["low"]
+tr1 = (
+    df["high"]
+    - df["low"]
+)
 
 tr2 = (
-    df["high"] - previous_close
+    df["high"]
+    - previous_close
 ).abs()
 
 tr3 = (
-    df["low"] - previous_close
+    df["low"]
+    - previous_close
 ).abs()
 
 true_range = pd.concat(
-    [tr1, tr2, tr3],
+    [
+        tr1,
+        tr2,
+        tr3,
+    ],
     axis=1,
 ).max(axis=1)
 
 return true_range.rolling(
     period
 ).mean()
+
+============================================================
+
+KELTNER CHANNEL
+
+============================================================
 
 def calculate_keltner(
 df: pd.DataFrame,
@@ -356,7 +364,17 @@ lower = middle - (
     multiplier * atr
 )
 
-return middle, upper, lower
+return (
+    middle,
+    upper,
+    lower,
+)
+
+============================================================
+
+ADX
+
+============================================================
 
 def calculate_adx(
 df: pd.DataFrame,
@@ -367,7 +385,6 @@ low = df["low"]
 close = df["close"]
 
 up_move = high.diff()
-
 down_move = -low.diff()
 
 plus_dm = pd.Series(
@@ -380,20 +397,26 @@ minus_dm = pd.Series(
     index=df.index,
 )
 
-plus_dm[
+plus_condition = (
     (up_move > down_move)
     & (up_move > 0)
-] = up_move[
-    (up_move > down_move)
-    & (up_move > 0)
+)
+
+minus_condition = (
+    (down_move > up_move)
+    & (down_move > 0)
+)
+
+plus_dm.loc[
+    plus_condition
+] = up_move.loc[
+    plus_condition
 ]
 
-minus_dm[
-    (down_move > up_move)
-    & (down_move > 0)
-] = down_move[
-    (down_move > up_move)
-    & (down_move > 0)
+minus_dm.loc[
+    minus_condition
+] = down_move.loc[
+    minus_condition
 ]
 
 previous_close = close.shift(1)
@@ -401,8 +424,12 @@ previous_close = close.shift(1)
 tr = pd.concat(
     [
         high - low,
-        (high - previous_close).abs(),
-        (low - previous_close).abs(),
+        (
+            high - previous_close
+        ).abs(),
+        (
+            low - previous_close
+        ).abs(),
     ],
     axis=1,
 ).max(axis=1)
@@ -423,17 +450,36 @@ minus_di = (
     / atr
 )
 
+denominator = (
+    plus_di + minus_di
+)
+
 dx = (
     100
-    * (plus_di - minus_di).abs()
-    / (plus_di + minus_di)
+    * (
+        plus_di - minus_di
+    ).abs()
+    / denominator.replace(
+        0,
+        pd.NA,
+    )
 )
 
 adx = dx.rolling(
     period
 ).mean()
 
-return adx, plus_di, minus_di
+return (
+    adx,
+    plus_di,
+    minus_di,
+)
+
+============================================================
+
+RSI
+
+============================================================
 
 def calculate_rsi(
 df: pd.DataFrame,
@@ -457,16 +503,17 @@ avg_loss = loss.rolling(
     period
 ).mean()
 
-rs = avg_gain / avg_loss.replace(
-    0,
-    pd.NA,
+rs = (
+    avg_gain
+    / avg_loss.replace(
+        0,
+        pd.NA,
+    )
 )
 
-rsi = 100 - (
+return 100 - (
     100 / (1 + rs)
 )
-
-return rsi
 
 ============================================================
 
@@ -474,13 +521,11 @@ MARKET STRUCTURE
 
 ============================================================
 
-def market_structure(df: pd.DataFrame):
-"""
-Simple recent market structure.
-"""
-
+def market_structure(
+df: pd.DataFrame,
+):
 if len(df) < 8:
-    return "NEUTRAL"
+return "NEUTRAL"
 
 recent = df.tail(8)
 
@@ -509,18 +554,15 @@ return "NEUTRAL"
 
 ============================================================
 
-PAIR SCORING
+PAIR SCORE
 
 ============================================================
 
-def score_pair(df: pd.DataFrame):
-"""
-Score the pair using price action,
-structure, momentum, Keltner and ADX.
-"""
-
+def score_pair(
+df: pd.DataFrame,
+):
 if len(df) < 40:
-    return -999, "INSUFFICIENT_DATA"
+return -999, "NEUTRAL"
 
 work = df.copy()
 
@@ -550,24 +592,14 @@ work["minus_di"] = minus_di
 work["rsi"] = rsi
 
 last = work.iloc[-1]
-previous = work.iloc[-2]
 
 score = 0
-direction = "NEUTRAL"
-
-# --------------------------------------------------------
-# Candle direction
-# --------------------------------------------------------
 
 if last["close"] > last["open"]:
     score += 2
 
 elif last["close"] < last["open"]:
     score -= 2
-
-# --------------------------------------------------------
-# Recent momentum
-# --------------------------------------------------------
 
 recent_change = (
     last["close"]
@@ -580,10 +612,6 @@ if recent_change > 0:
 elif recent_change < 0:
     score -= 2
 
-# --------------------------------------------------------
-# Market structure
-# --------------------------------------------------------
-
 structure = market_structure(
     work
 )
@@ -593,10 +621,6 @@ if structure == "BULLISH":
 
 elif structure == "BEARISH":
     score -= 3
-
-# --------------------------------------------------------
-# ADX + DMI
-# --------------------------------------------------------
 
 if pd.notna(last["adx"]):
 
@@ -614,11 +638,7 @@ if pd.notna(last["adx"]):
         ):
             score -= 3
 
-# --------------------------------------------------------
-# Keltner
-# --------------------------------------------------------
-
-if pd.notna(last["upper"]):
+if pd.notna(last["middle"]):
 
     if last["close"] > last["middle"]:
         score += 1
@@ -626,11 +646,7 @@ if pd.notna(last["upper"]):
     elif last["close"] < last["middle"]:
         score -= 1
 
-# --------------------------------------------------------
-# Candle confirmation
-# --------------------------------------------------------
-
-body = abs(
+candle_body = abs(
     last["close"]
     - last["open"]
 )
@@ -643,23 +659,17 @@ candle_range = (
 if candle_range > 0:
 
     body_ratio = (
-        body / candle_range
+        candle_body
+        / candle_range
     )
 
     if body_ratio >= 0.55:
 
-        if (
-            last["close"]
-            > last["open"]
-        ):
+        if last["close"] > last["open"]:
             score += 2
 
         else:
             score -= 2
-
-# --------------------------------------------------------
-# RSI secondary filter
-# --------------------------------------------------------
 
 if pd.notna(last["rsi"]):
 
@@ -668,10 +678,6 @@ if pd.notna(last["rsi"]):
 
     elif last["rsi"] <= 30:
         score += 1
-
-# --------------------------------------------------------
-# Final direction
-# --------------------------------------------------------
 
 if score >= 0:
     direction = "UP"
@@ -682,7 +688,7 @@ return abs(score), direction
 
 ============================================================
 
-CHART CREATION
+CREATE CHART
 
 ============================================================
 
@@ -690,10 +696,6 @@ def create_chart(
 df: pd.DataFrame,
 symbol: str,
 ):
-"""
-Create a clean 2-minute candlestick-style chart.
-"""
-
 data = df.tail(40).copy()
 
 middle, upper, lower = calculate_keltner(
@@ -704,11 +706,7 @@ middle, upper, lower = calculate_keltner(
 )
 
 fig, ax = plt.subplots(
-    figsize=(12, 6),
-)
-
-x_values = range(
-    len(data)
+    figsize=(12, 6)
 )
 
 for i, (_, row) in enumerate(
@@ -727,7 +725,10 @@ for i, (_, row) in enumerate(
 
     ax.plot(
         [i, i],
-        [low_price, high_price],
+        [
+            low_price,
+            high_price,
+        ],
         color=candle_color,
         linewidth=1.2,
     )
@@ -743,10 +744,14 @@ for i, (_, row) in enumerate(
     )
 
     if height == 0:
-        height = (
-            high_price
-            - low_price
-        ) * 0.02
+        height = max(
+            (
+                high_price
+                - low_price
+            )
+            * 0.02,
+            0.000001,
+        )
 
     ax.bar(
         i,
@@ -756,6 +761,10 @@ for i, (_, row) in enumerate(
         color=candle_color,
         alpha=0.8,
     )
+
+x_values = range(
+    len(data)
+)
 
 ax.plot(
     x_values,
@@ -819,16 +828,16 @@ return image
 
 ============================================================
 
-GEMINI ANALYSIS
+GEMINI PROMPT
 
 ============================================================
 
 ANALYSIS_PROMPT = """
 أنت محلل تقني متخصص في التداول قصير المدى على شارتات Forex.
 
-حلل صورة الشارت بدقة، وركز على آخر الشموع فقط.
+حلل صورة الشارت بدقة وركز على آخر حركة سعرية.
 
-الأولوية في التحليل:
+الأولوية:
 
 1. Price Action
 2. فتح وإغلاق الشموع
@@ -839,57 +848,56 @@ ANALYSIS_PROMPT = """
 7. Candle Confirmation
 8. ADX + DMI
 9. Keltner Channel 20/10
-10. RSI كعامل ثانوي فقط
+10. RSI كعامل ثانوي
 
-قواعد مهمة:
+القواعد:
 
 - يجب اختيار اتجاه واحد فقط: UP أو DOWN.
 - ممنوع NO SIGNAL.
 - ممنوع WAIT.
-- لا تعطيني اتجاهين.
-- اختر الاتجاه الذي لديه أقوى أدلة في الشارت.
+- لا تعط اتجاهين.
+- اختر الاتجاه الذي لديه أقوى الأدلة.
 - لا تعتمد على شمعة واحدة فقط إذا كانت بنية السوق تعارضها.
-- راقب Higher High / Higher Low في الصعود.
-- راقب Lower High / Lower Low في الهبوط.
-- راقب الإغلاق الحقيقي خارج النطاق عند الاختراق.
-- إذا كان الاختراق ضعيفًا وحدث رفض، اعتبر احتمال Failed Breakout.
-- استخدم Keltner وADX لتأكيد الحركة وليس بدل Price Action.
-- RSI عامل مساعد وليس العامل الأساسي.
-- حدد تأخير الدخول المناسب: 1 أو 2 أو 3 دقائق.
-- الهدف هو الدخول في بداية شمعة مستقبلية، وليس الدخول عشوائيًا فورًا.
-- أعط سعر دخول تقريبي من آخر سعر ظاهر في الشارت.
+- راقب Higher High / Higher Low للصعود.
+- راقب Lower High / Lower Low للهبوط.
+- راقب الإغلاق الحقيقي عند الاختراق.
+- راقب Failed Breakout والرفض.
+- استخدم Keltner وADX للتأكيد وليس بدل Price Action.
+- RSI عامل مساعد فقط.
+- حدد تأخير الدخول 1 أو 2 أو 3 دقائق.
+- أعط وقت الدخول فقط، بدون وقت انتهاء.
+- أعط سعر الدخول.
 - أعط مستوى إلغاء واضح.
-- UP: يتم إلغاء الإشارة إذا أغلقت شمعة تحت مستوى الإلغاء.
-- DOWN: يتم إلغاء الإشارة إذا أغلقت شمعة فوق مستوى الإلغاء.
-- لا تستخدم أكثر من 6 أرقام بعد الفاصلة للسعر.
+- UP: إلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
+- DOWN: إلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
+- السعر بحد أقصى 6 أرقام بعد الفاصلة.
 
-أرجع JSON فقط بدون Markdown وبدون شرح خارجه:
+أرجع JSON فقط:
 
 {
 "direction": "UP أو DOWN",
-"confidence": 50-95,
-"entry_delay_minutes": 1 أو 2 أو 3,
+"confidence": 50,
+"entry_delay_minutes": 1,
 "entry_price": 0.0,
 "cancellation_price": 0.0,
-"reason": "سبب مختصر وواضح",
+"reason": "سبب مختصر",
 "structure": "BULLISH أو BEARISH أو NEUTRAL",
 "momentum": "BULLISH أو BEARISH أو NEUTRAL"
 }
 """
 
+============================================================
+
+GEMINI ANALYSIS
+
+============================================================
+
 async def analyze_with_gemini(
 image_bytes: bytes,
 symbol: str,
 ):
-"""
-Send chart image to Gemini and parse JSON.
-"""
 
 try:
-
-    encoded = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
 
     prompt = (
         ANALYSIS_PROMPT
@@ -910,7 +918,9 @@ try:
                     {
                         "inline_data": {
                             "mime_type": "image/png",
-                            "data": encoded,
+                            "data": base64.b64encode(
+                                image_bytes
+                            ).decode("utf-8"),
                         }
                     },
                 ],
@@ -931,7 +941,6 @@ try:
 
     text = text.strip()
 
-    # Remove accidental Markdown fences.
     if text.startswith("```"):
         text = text.replace(
             "```json",
@@ -945,7 +954,9 @@ try:
         ).strip()
 
     try:
-        result = json.loads(text)
+        result = json.loads(
+            text
+        )
 
     except json.JSONDecodeError:
 
@@ -962,7 +973,9 @@ try:
             )
 
         result = json.loads(
-            text[start:end + 1]
+            text[
+                start:end + 1
+            ]
         )
 
     if not isinstance(
@@ -1034,7 +1047,7 @@ try:
     reason = str(
         result.get(
             "reason",
-            "Price Action and market structure confirmation.",
+            "Price Action confirmation.",
         )
     )
 
@@ -1074,11 +1087,13 @@ try:
     }
 
 except Exception as e:
+
     logger.exception(
         "Gemini analysis failed for %s: %s",
         symbol,
         e,
     )
+
     raise
 
 ============================================================
@@ -1109,9 +1124,6 @@ FIND BEST PAIR
 ============================================================
 
 async def find_best_pair():
-"""
-Scan all pairs concurrently.
-"""
 
 logger.info(
     "Starting forex pair scan..."
@@ -1203,14 +1215,14 @@ if not candidates:
     )
 
 candidates.sort(
-    key=lambda x: x["score"],
+    key=lambda item: item["score"],
     reverse=True,
 )
 
 best = candidates[0]
 
 logger.info(
-    "Best pair selected: %s score=%s direction=%s",
+    "Best pair selected: %s | score=%s | direction=%s",
     best["symbol"],
     best["score"],
     best["direction"],
@@ -1220,7 +1232,7 @@ return best
 
 ============================================================
 
-FORMAT SIGNAL
+SIGNAL FORMAT
 
 ============================================================
 
@@ -1228,8 +1240,9 @@ def format_signal(
 symbol: str,
 result: dict,
 ):
+
 direction = result[
-"direction"
+    "direction"
 ]
 
 confidence = result[
@@ -1257,15 +1270,24 @@ entry_time = calculate_entry_time(
 )
 
 if direction == "UP":
-    direction_text = "🟢 UP — شراء"
+
+    direction_text = (
+        "🟢 UP — شراء"
+    )
+
     cancel_text = (
-        f"إذا أغلقت الشمعة تحت "
+        "إلغاء إذا أغلقت الشمعة تحت "
         f"{cancellation_price}"
     )
+
 else:
-    direction_text = "🔴 DOWN — بيع"
+
+    direction_text = (
+        "🔴 DOWN — بيع"
+    )
+
     cancel_text = (
-        f"إذا أغلقت الشمعة فوق "
+        "إلغاء إذا أغلقت الشمعة فوق "
         f"{cancellation_price}"
     )
 
@@ -1278,7 +1300,7 @@ return (
     f"🕐 وقت الدخول: {entry_time}\n"
     f"⏳ بعد: {delay} دقيقة\n\n"
     f"💵 سعر الدخول: {entry_price}\n"
-    f"🛑 إلغاء إذا {cancel_text}\n\n"
+    f"🛑 {cancel_text}\n\n"
     f"📈 Market Structure: "
     f"{result['structure']}\n"
     f"⚡ Momentum: "
@@ -1288,7 +1310,7 @@ return (
 
 ============================================================
 
-/START
+START
 
 ============================================================
 
@@ -1340,10 +1362,6 @@ processing_message = await query.message.reply_text(
 
 try:
 
-    # ----------------------------------------------------
-    # STEP 1 — Scan pairs
-    # ----------------------------------------------------
-
     best = await find_best_pair()
 
     symbol = best[
@@ -1365,17 +1383,13 @@ try:
         symbol,
     )
 
-    # ----------------------------------------------------
-    # STEP 2 — Create chart
-    # ----------------------------------------------------
-
     chart = await asyncio.to_thread(
         create_chart,
         candles,
         symbol,
     )
 
-    if not chart:
+    if chart is None:
         raise RuntimeError(
             "Chart creation failed"
         )
@@ -1388,14 +1402,10 @@ try:
         )
 
     logger.info(
-        "Chart created for %s (%s bytes)",
+        "Chart created for %s: %s bytes",
         symbol,
         len(chart_bytes),
     )
-
-    # ----------------------------------------------------
-    # STEP 3 — Gemini
-    # ----------------------------------------------------
 
     await processing_message.edit_text(
         f"📊 {symbol}\n"
@@ -1406,10 +1416,6 @@ try:
         chart_bytes,
         symbol,
     )
-
-    # ----------------------------------------------------
-    # STEP 4 — Signal
-    # ----------------------------------------------------
 
     signal_text = format_signal(
         symbol,
@@ -1437,21 +1443,26 @@ except Exception as e:
         e,
     )
 
+    error_text = (
+        "❌ حدث خطأ أثناء التحليل:\n\n"
+        f"{str(e)[:1000]}"
+    )
+
     try:
+
         await processing_message.edit_text(
-            "❌ حدث خطأ أثناء التحليل:\n\n"
-            f"{str(e)[:1000]}"
+            error_text
         )
 
     except Exception:
+
         await query.message.reply_text(
-            "❌ حدث خطأ أثناء التحليل:\n\n"
-            f"{str(e)[:1000]}"
+            error_text
         )
 
 ============================================================
 
-TEXT HANDLER
+TEXT
 
 ============================================================
 
@@ -1469,7 +1480,7 @@ await update.message.reply_text(
 
 ============================================================
 
-PHOTO HANDLER
+PHOTO
 
 ============================================================
 
@@ -1492,7 +1503,7 @@ HEALTH SERVER
 ============================================================
 
 async def health(
-request
+request,
 ):
 return web.Response(
 text="ZinoQuotexSignalAI is running"
