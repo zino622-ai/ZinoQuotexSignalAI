@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import asyncio
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -35,7 +35,12 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.5-flash-lite",
 )
 
-PORT = int(os.getenv("PORT", "10000"))
+PORT_RAW = os.getenv("PORT", "10000")
+
+try:
+    PORT = int(PORT_RAW)
+except ValueError:
+    PORT = 10000
 
 
 if not BOT_TOKEN:
@@ -239,12 +244,12 @@ def extract_json(text: str) -> dict:
 def analyze_chart(image_bytes: bytes) -> dict:
 
     prompt = """
-You are a chart-analysis assistant that follows a simple
-BotTrader-style analysis.
+You are a simple BotTrader-style chart analysis assistant
+for Quotex.
 
 Analyze the screenshot carefully.
 
-Use ONLY information that is actually visible in the screenshot.
+Use ONLY information that is actually visible in the chart.
 
 Identify:
 
@@ -257,25 +262,27 @@ Identify:
 
 IMPORTANT:
 
+Keep the analysis simple.
+
 Do NOT invent information.
 
 Do NOT invent indicators that are not visible.
 
-Do NOT add RSI if it is not visible.
+Do NOT add RSI unless RSI is actually visible.
 
-Do NOT add MACD if it is not visible.
+Do NOT add MACD unless MACD is actually visible.
 
-Do NOT add Bollinger Bands if they are not visible.
+Do NOT add Bollinger Bands unless they are actually visible.
 
-Do NOT add Keltner Channel if it is not visible.
+Do NOT add Keltner Channel unless it is actually visible.
 
-Do NOT add ADX if it is not visible.
+Do NOT add ADX unless it is actually visible.
 
-Do NOT add Support/Resistance if it is not visible.
+Do NOT add Support/Resistance unless clearly visible.
 
-Keep the system simple.
+Do NOT use hidden or imaginary indicators.
 
-The final signal MUST always be:
+The final signal MUST always be exactly one of:
 
 STRONG BUY
 
@@ -285,9 +292,15 @@ STRONG SELL
 
 Never return NO SIGNAL.
 
+Do not alternate BUY and SELL artificially.
+
+Do not use previous signals.
+
+Analyze every screenshot independently.
+
 Return ONLY valid JSON.
 
-Use exactly these keys:
+Use exactly this structure:
 
 {
   "asset": "USD/JPY",
@@ -300,42 +313,37 @@ Use exactly these keys:
 
 Rules:
 
-- asset:
-  Identify the visible trading pair.
+asset:
+Read the visible pair as accurately as possible.
 
-- timeframe:
-  Read the visible chart timeframe.
+timeframe:
+Read the visible chart timeframe.
 
-- broker:
-  Always return "Quotex".
+broker:
+Always return "Quotex".
 
-- moving_average:
-  Return "Buy", "Sell", or "Not Visible".
+moving_average:
+Return "Buy", "Sell", or "Not Visible".
 
-- technical_indicators:
-  Give a concise overall direction such as:
-  "Strong Buy"
-  "Buy"
-  "Strong Sell"
-  "Sell"
-  "Mixed"
-  "Not Visible"
+technical_indicators:
+Return a concise description such as:
+"Strong Buy"
+"Buy"
+"Strong Sell"
+"Sell"
+"Mixed"
+"Not Visible"
 
-- signal:
-  MUST be exactly:
-  "STRONG BUY"
-  or
-  "STRONG SELL"
+signal:
+Must be exactly:
+"STRONG BUY"
+or
+"STRONG SELL"
 
-Choose the signal according to the strongest visible
-technical evidence in the screenshot.
-
-Do not alternate directions artificially.
-
-Do not force BUY or SELL based on previous signals.
-
-Each screenshot must be analyzed independently.
+Choose the direction from the strongest visible evidence
+in the screenshot.
 """
+
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
@@ -410,10 +418,10 @@ def format_signal(data: dict) -> str:
         )
     ).upper().strip()
 
-    if signal not in {
+    if signal not in (
         "STRONG BUY",
         "STRONG SELL",
-    }:
+    ):
         signal = "STRONG BUY"
 
     if signal == "STRONG BUY":
@@ -582,8 +590,9 @@ async def error_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    logger.exception(
-        "Unhandled exception",
+    logger.error(
+        "Unhandled exception: %s",
+        context.error,
         exc_info=context.error,
     )
 
@@ -592,9 +601,7 @@ async def error_handler(
 # RENDER HEALTH SERVER
 # =========================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
@@ -605,11 +612,31 @@ class HealthHandler(
             "text/plain; charset=utf-8",
         )
 
+        self.send_header(
+            "Content-Length",
+            str(
+                len(
+                    b"ZinoQuotexSignalAI is running"
+                )
+            ),
+        )
+
         self.end_headers()
 
         self.wfile.write(
             b"ZinoQuotexSignalAI is running"
         )
+
+    def do_HEAD(self):
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
+
+        self.end_headers()
 
     def log_message(
         self,
@@ -621,20 +648,28 @@ class HealthHandler(
 
 def start_health_server() -> None:
 
-    server = HTTPServer(
-        (
-            "0.0.0.0",
+    try:
+
+        server = ThreadingHTTPServer(
+            (
+                "0.0.0.0",
+                PORT,
+            ),
+            HealthHandler,
+        )
+
+        logger.info(
+            "HEALTH SERVER READY - port %s",
             PORT,
-        ),
-        HealthHandler,
-    )
+        )
 
-    logger.info(
-        "Health server listening on port %s",
-        PORT,
-    )
+        server.serve_forever()
 
-    server.serve_forever()
+    except Exception:
+
+        logger.exception(
+            "Health server failed"
+        )
 
 
 # =========================================================
@@ -643,9 +678,24 @@ def start_health_server() -> None:
 
 def main() -> None:
 
+    logger.info(
+        "Starting ZinoQuotexSignalAI..."
+    )
+
+    logger.info(
+        "Render PORT: %s",
+        PORT,
+    )
+
+    logger.info(
+        "Gemini model: %s",
+        GEMINI_MODEL,
+    )
+
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
+        name="render-health",
     )
 
     health_thread.start()
@@ -682,12 +732,7 @@ def main() -> None:
     )
 
     logger.info(
-        "ZinoQuotexSignalAI started"
-    )
-
-    logger.info(
-        "Gemini model: %s",
-        GEMINI_MODEL,
+        "Telegram bot polling started"
     )
 
     application.run_polling(
@@ -700,4 +745,4 @@ def main() -> None:
 # =========================================================
 
 if __name__ == "__main__":
-    main()ضش
+    main()
