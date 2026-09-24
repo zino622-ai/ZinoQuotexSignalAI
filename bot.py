@@ -2,12 +2,14 @@ import os
 import io
 import json
 import logging
+import threading
+import asyncio
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,8 +32,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_RAW = os.getenv("OWNER_ID")
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
+    "gemini-3.5-flash-lite",
 )
+
+PORT = int(os.getenv("PORT", "10000"))
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -44,8 +49,8 @@ if not OWNER_ID_RAW:
 
 try:
     OWNER_ID = int(OWNER_ID_RAW)
-except ValueError:
-    raise RuntimeError("OWNER_ID must be an integer")
+except ValueError as exc:
+    raise RuntimeError("OWNER_ID must be an integer") from exc
 
 
 # =========================================================
@@ -53,8 +58,8 @@ except ValueError:
 # =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
 logger = logging.getLogger("ZinoAI")
@@ -64,13 +69,13 @@ logger = logging.getLogger("ZinoAI")
 # GEMINI
 # =========================================================
 
-gemini = genai.Client(
+client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
 
 # =========================================================
-# MEMORY
+# BOT STATE
 # =========================================================
 
 latest_chart = None
@@ -89,71 +94,44 @@ stats = {
 def is_owner(update: Update) -> bool:
     user = update.effective_user
 
-    return bool(
-        user and user.id == OWNER_ID
-    )
-
-
-async def reject_non_owner(update: Update) -> bool:
-
-    if is_owner(update):
+    if not user:
         return False
 
-    if update.callback_query:
+    return user.id == OWNER_ID
 
-        try:
-            await update.callback_query.answer(
-                "⛔ هذا البوت خاص بالمالك.",
-                show_alert=True,
-            )
-        except Exception:
-            pass
 
-    elif update.effective_message:
-
+async def reject_non_owner(update: Update) -> None:
+    if update.effective_message:
         await update.effective_message.reply_text(
-            "⛔ هذا البوت خاص بالمالك."
+            "⛔ هذا البوت خاص بالمالك فقط."
         )
 
-    return True
-
 
 # =========================================================
-# KEYBOARDS
+# KEYBOARD
 # =========================================================
 
-def signal_keyboard():
-
-    return InlineKeyboardMarkup([
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "🎯 Get Signal",
-                callback_data="get_signal"
-            )
+            [
+                InlineKeyboardButton(
+                    "🎯 Get Signal",
+                    callback_data="get_signal",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ WIN",
+                    callback_data="win",
+                ),
+                InlineKeyboardButton(
+                    "❌ LOSS",
+                    callback_data="loss",
+                ),
+            ],
         ]
-    ])
-
-
-def result_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ WIN",
-                callback_data="result_win"
-            ),
-            InlineKeyboardButton(
-                "❌ LOSS",
-                callback_data="result_loss"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🎯 Get Signal",
-                callback_data="get_signal"
-            )
-        ]
-    ])
+    )
 
 
 # =========================================================
@@ -162,17 +140,18 @@ def result_keyboard():
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    if await reject_non_owner(update):
+    if not is_owner(update):
+        await reject_non_owner(update)
         return
 
     await update.message.reply_text(
-        "🤖 ZINO BOTTRADER AI\n\n"
+        "🎓 ZinoQuotexSignalAI\n\n"
         "📸 أرسل Screenshot للشارت.\n"
-        "بعدها اضغط على Get Signal.",
-        reply_markup=signal_keyboard(),
+        "ثم اضغط 🎯 Get Signal.",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -180,141 +159,131 @@ async def start(
 # RECEIVE SCREENSHOT
 # =========================================================
 
-async def receive_photo(
+async def receive_chart(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
     global latest_chart
 
-    if await reject_non_owner(update):
+    if not is_owner(update):
+        await reject_non_owner(update)
+        return
+
+    if not update.message:
+        return
+
+    if not update.message.photo:
         return
 
     photo = update.message.photo[-1]
 
-    file = await context.bot.get_file(
+    telegram_file = await context.bot.get_file(
         photo.file_id
     )
 
-    buffer = io.BytesIO()
+    image_bytes = io.BytesIO()
 
-    await file.download_to_memory(
-        buffer
+    await telegram_file.download_to_memory(
+        image_bytes
     )
 
-    latest_chart = buffer.getvalue()
+    image_bytes.seek(0)
+
+    latest_chart = image_bytes.getvalue()
 
     await update.message.reply_text(
-        "📸 Chart received.\n\n"
-        "اضغط Get Signal لتحليل الشارت.",
-        reply_markup=signal_keyboard(),
+        "📸 تم استلام الشارت.\n\n"
+        "🎯 اضغط Get Signal للتحليل.",
+        reply_markup=main_keyboard(),
     )
 
 
 # =========================================================
-# BOTTRADER ANALYSIS PROMPT
+# JSON EXTRACTION
 # =========================================================
 
-ANALYSIS_PROMPT = r"""
-You are a professional chart-analysis AI working in the style of
-a simple Quotex BotTrader signal system.
+def extract_json(text: str) -> dict:
 
-Analyze ONLY the screenshot provided by the user.
+    text = text.strip()
 
-The output must follow this exact analytical structure:
+    if text.startswith("```"):
 
-1. Asset / currency pair
-2. Timeframe
-3. Broker
-4. Moving average
-5. Technical indicators
-6. Final trading signal
+        lines = text.splitlines()
 
-Example:
+        if lines:
+            lines = lines[1:]
 
-USD/JPY
-Time: 5 MIN
-Broker: Quotex
-Moving average: Sell
-Technical indicators: Strong Sell
-Trading signal from bot: STRONG SELL
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
 
-IMPORTANT ANALYSIS RULES:
+        text = "\n".join(lines).strip()
 
-- Read the asset/pair from the screenshot.
-- Read the visible timeframe from the screenshot.
-- Broker is Quotex unless the screenshot clearly shows another broker.
-- Analyze the visible moving-average direction.
-- Analyze the visible technical-indicator direction.
-- Determine whether the combined evidence is BUY or SELL.
-- The final signal must be either:
-  STRONG BUY
-  or
-  STRONG SELL
-- Do NOT return NO_SIGNAL.
-- Always provide one final direction.
-- Do NOT invent exact indicator numbers that cannot be seen.
-- Do NOT invent prices.
-- Do NOT invent a timeframe.
-- Do NOT claim guaranteed profit or guaranteed accuracy.
-- Do NOT add Keltner Channel.
-- Do NOT add ADX.
-- Do NOT add RSI unless it is visibly present and relevant to the
-  technical-indicator assessment.
-- Do NOT add MACD unless it is visibly present and relevant.
-- Do NOT add Bollinger Bands unless they are visibly present.
-- Do NOT add support/resistance levels.
-- Do NOT add entry price.
-- Do NOT add expiry.
-- Do NOT add extra indicators that are not visible.
-- Focus on the same simple structure as the BotTrader example.
+    start = text.find("{")
+    end = text.rfind("}")
 
-MOVING AVERAGE:
+    if start == -1 or end == -1:
+        raise ValueError(
+            "Gemini did not return valid JSON"
+        )
 
-Classify the visible moving-average bias as one of:
+    json_text = text[start:end + 1]
 
-Buy
-Sell
-Neutral
+    return json.loads(json_text)
 
-If the chart clearly shows the price moving above the relevant
-moving-average structure, this supports Buy.
 
-If the chart clearly shows the price moving below the relevant
-moving-average structure, this supports Sell.
+# =========================================================
+# CHART ANALYSIS
+# =========================================================
 
-If the visible moving-average information is mixed, use the
-overall visible direction rather than inventing a value.
+def analyze_chart(image_bytes: bytes) -> dict:
 
-TECHNICAL INDICATORS:
+    prompt = """
+You are a chart-analysis assistant that follows a simple
+BotTrader-style analysis.
 
-Classify the overall visible technical-indicator bias as:
+Analyze the screenshot carefully.
 
-Strong Buy
-Buy
-Neutral
-Sell
-Strong Sell
+Use ONLY information that is actually visible in the screenshot.
 
-Use the visible evidence from the screenshot.
+Identify:
 
-FINAL SIGNAL:
+1. Currency pair / asset.
+2. Visible timeframe.
+3. Moving average direction if a moving average is visible.
+4. Overall technical-indicator direction if visible.
+5. Recent candle direction and price action.
+6. Market structure and breakout/rejection when clearly visible.
 
-Combine the Moving Average and Technical Indicators.
+IMPORTANT:
 
-If both support buying:
+Do NOT invent information.
+
+Do NOT invent indicators that are not visible.
+
+Do NOT add RSI if it is not visible.
+
+Do NOT add MACD if it is not visible.
+
+Do NOT add Bollinger Bands if they are not visible.
+
+Do NOT add Keltner Channel if it is not visible.
+
+Do NOT add ADX if it is not visible.
+
+Do NOT add Support/Resistance if it is not visible.
+
+Keep the system simple.
+
+The final signal MUST always be:
+
 STRONG BUY
 
-If both support selling:
+or
+
 STRONG SELL
 
-If they are mixed:
-choose the direction supported by the stronger visible
-price-action/indicator evidence.
-
-Never return NO_SIGNAL.
-
-Do not use markdown.
+Never return NO SIGNAL.
 
 Return ONLY valid JSON.
 
@@ -326,69 +295,57 @@ Use exactly these keys:
   "broker": "Quotex",
   "moving_average": "Sell",
   "technical_indicators": "Strong Sell",
-  "trading_signal": "STRONG SELL"
+  "signal": "STRONG SELL"
 }
+
+Rules:
+
+- asset:
+  Identify the visible trading pair.
+
+- timeframe:
+  Read the visible chart timeframe.
+
+- broker:
+  Always return "Quotex".
+
+- moving_average:
+  Return "Buy", "Sell", or "Not Visible".
+
+- technical_indicators:
+  Give a concise overall direction such as:
+  "Strong Buy"
+  "Buy"
+  "Strong Sell"
+  "Sell"
+  "Mixed"
+  "Not Visible"
+
+- signal:
+  MUST be exactly:
+  "STRONG BUY"
+  or
+  "STRONG SELL"
+
+Choose the signal according to the strongest visible
+technical evidence in the screenshot.
+
+Do not alternate directions artificially.
+
+Do not force BUY or SELL based on previous signals.
+
+Each screenshot must be analyzed independently.
 """
 
-
-# =========================================================
-# CLEAN JSON
-# =========================================================
-
-def clean_json(text: str):
-
-    text = text.strip()
-
-    if text.startswith("```"):
-
-        text = text.replace(
-            "```json",
-            "",
-            1
-        )
-
-        text = text.replace(
-            "```",
-            ""
-        )
-
-        text = text.strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
-        raise ValueError(
-            "Gemini did not return valid JSON"
-        )
-
-    return json.loads(
-        text[start:end + 1]
-    )
-
-
-# =========================================================
-# ANALYZE CHART
-# =========================================================
-
-async def analyze_chart():
-
-    if not latest_chart:
-        raise ValueError(
-            "No chart screenshot available"
-        )
-
-    response = gemini.models.generate_content(
+    response = client.models.generate_content(
         model=GEMINI_MODEL,
-
         contents=[
             types.Part.from_bytes(
-                data=latest_chart,
+                data=image_bytes,
                 mime_type="image/jpeg",
             ),
-            ANALYSIS_PROMPT,
+            prompt,
         ],
-
         config=types.GenerateContentConfig(
             temperature=0.1,
             response_mime_type="application/json",
@@ -400,138 +357,105 @@ async def analyze_chart():
             "Gemini returned an empty response"
         )
 
-    data = clean_json(
+    return extract_json(
         response.text
     )
-
-    asset = str(
-        data.get(
-            "asset",
-            "Unknown"
-        )
-    ).strip()
-
-    timeframe = str(
-        data.get(
-            "timeframe",
-            "Unknown"
-        )
-    ).strip()
-
-    broker = str(
-        data.get(
-            "broker",
-            "Quotex"
-        )
-    ).strip()
-
-    moving_average = str(
-        data.get(
-            "moving_average",
-            ""
-        )
-    ).strip()
-
-    technical_indicators = str(
-        data.get(
-            "technical_indicators",
-            ""
-        )
-    ).strip()
-
-    trading_signal = str(
-        data.get(
-            "trading_signal",
-            ""
-        )
-    ).strip().upper()
-
-    if not asset:
-        asset = "Unknown"
-
-    if not timeframe:
-        timeframe = "Unknown"
-
-    if not broker:
-        broker = "Quotex"
-
-    valid_ma = {
-        "BUY",
-        "SELL",
-        "NEUTRAL",
-    }
-
-    valid_technical = {
-        "STRONG BUY",
-        "BUY",
-        "NEUTRAL",
-        "SELL",
-        "STRONG SELL",
-    }
-
-    if moving_average.upper() not in valid_ma:
-
-        raise ValueError(
-            f"Invalid moving average result: "
-            f"{moving_average}"
-        )
-
-    if technical_indicators.upper() not in valid_technical:
-
-        raise ValueError(
-            f"Invalid technical indicators result: "
-            f"{technical_indicators}"
-        )
-
-    if trading_signal not in {
-        "STRONG BUY",
-        "STRONG SELL",
-    }:
-
-        raise ValueError(
-            f"Invalid trading signal: "
-            f"{trading_signal}"
-        )
-
-    return {
-        "asset": asset,
-        "timeframe": timeframe,
-        "broker": broker,
-        "moving_average": moving_average,
-        "technical_indicators": technical_indicators,
-        "trading_signal": trading_signal,
-    }
 
 
 # =========================================================
 # FORMAT SIGNAL
 # =========================================================
 
-def format_signal(data):
+def format_signal(data: dict) -> str:
 
-    signal = data["trading_signal"]
+    asset = str(
+        data.get(
+            "asset",
+            "Unknown",
+        )
+    )
+
+    timeframe = str(
+        data.get(
+            "timeframe",
+            "Unknown",
+        )
+    )
+
+    broker = str(
+        data.get(
+            "broker",
+            "Quotex",
+        )
+    )
+
+    moving_average = str(
+        data.get(
+            "moving_average",
+            "Not Visible",
+        )
+    )
+
+    technical_indicators = str(
+        data.get(
+            "technical_indicators",
+            "Not Visible",
+        )
+    )
+
+    signal = str(
+        data.get(
+            "signal",
+            "",
+        )
+    ).upper().strip()
+
+    if signal not in {
+        "STRONG BUY",
+        "STRONG SELL",
+    }:
+        signal = "STRONG BUY"
 
     if signal == "STRONG BUY":
-
-        signal_display = "🟢 STRONG BUY"
-
+        emoji = "🟢"
     else:
-
-        signal_display = "🔴 STRONG SELL"
+        emoji = "🔴"
 
     return (
-        f"📊 {data['asset']}\n"
-        f"⏱ Time: {data['timeframe']}\n"
-        f"🏦 Broker: {data['broker']}\n\n"
+        f"📊 {asset}\n"
+        f"⏱ Time: {timeframe}\n"
+        f"🏦 Broker: {broker}\n"
+        f"📈 Moving average: {moving_average}\n"
+        f"📊 Technical indicators: "
+        f"{technical_indicators}\n"
+        f"🎯 Trading signal from bot: "
+        f"{emoji} {signal}"
+    )
 
-        f"Moving average: "
-        f"{data['moving_average']}\n"
 
-        f"Technical indicators: "
-        f"{data['technical_indicators']}\n\n"
+# =========================================================
+# STATS
+# =========================================================
 
-        f"Trading signal from bot: "
-        f"{signal_display}"
+def format_stats() -> str:
+
+    wins = stats["win"]
+    losses = stats["loss"]
+    total = wins + losses
+
+    if total > 0:
+        win_rate = (
+            wins / total
+        ) * 100
+    else:
+        win_rate = 0
+
+    return (
+        "📊 إحصائيات الإشارات\n\n"
+        f"✅ WIN: {wins}\n"
+        f"❌ LOSS: {losses}\n"
+        f"📌 TOTAL: {total}\n"
+        f"🎯 WIN RATE: {win_rate:.1f}%"
     )
 
 
@@ -541,44 +465,43 @@ def format_signal(data):
 
 async def get_signal(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+) -> None:
 
     global last_signal
 
-    query = update.callback_query
-
-    if await reject_non_owner(update):
+    if not is_owner(update):
+        await reject_non_owner(update)
         return
+
+    query = update.callback_query
 
     await query.answer()
 
-    if not latest_chart:
+    if latest_chart is None:
 
         await query.message.reply_text(
             "📸 أرسل Screenshot للشارت أولاً.",
-            reply_markup=signal_keyboard(),
+            reply_markup=main_keyboard(),
         )
 
         return
 
-    analyzing_message = await query.message.reply_text(
-        "🔎 Analyzing chart..."
+    status_message = await query.message.reply_text(
+        "🔎 جاري تحليل الشارت..."
     )
 
     try:
 
-        data = await analyze_chart()
+        data = await asyncio.to_thread(
+            analyze_chart,
+            latest_chart,
+        )
 
         last_signal = data
 
-        await analyzing_message.edit_text(
-            format_signal(data)
-        )
-
-        await query.message.reply_text(
-            "هل كانت النتيجة؟",
-            reply_markup=result_keyboard(),
+        await status_message.edit_text(
+            format_signal(data),
+            reply_markup=main_keyboard(),
         )
 
     except Exception as exc:
@@ -587,105 +510,64 @@ async def get_signal(
             "Analysis error"
         )
 
-        try:
-
-            await analyzing_message.edit_text(
-                f"❌ Analysis error:\n{exc}"
-            )
-
-        except Exception:
-
-            await query.message.reply_text(
-                f"❌ Analysis error:\n{exc}",
-                reply_markup=signal_keyboard(),
-            )
-
-
-# =========================================================
-# WIN / LOSS
-# =========================================================
-
-async def result_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    if await reject_non_owner(update):
-        return
-
-    await query.answer()
-
-    if query.data == "result_win":
-
-        stats["win"] += 1
-
-        text = "✅ WIN recorded."
-
-    else:
-
-        stats["loss"] += 1
-
-        text = "❌ LOSS recorded."
-
-    total = (
-        stats["win"]
-        +
-        stats["loss"]
-    )
-
-    if total:
-
-        win_rate = (
-            stats["win"]
-            /
-            total
-        ) * 100
-
-    else:
-
-        win_rate = 0
-
-    await query.message.reply_text(
-
-        f"{text}\n\n"
-        f"WIN: {stats['win']}\n"
-        f"LOSS: {stats['loss']}\n"
-        f"Win Rate: {win_rate:.0f}%",
-
-        reply_markup=signal_keyboard(),
-    )
+        await status_message.edit_text(
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{exc}",
+            reply_markup=main_keyboard(),
+        )
 
 
 # =========================================================
 # BUTTON ROUTER
 # =========================================================
 
-async def button_handler(
+async def button_router(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not is_owner(update):
+        await reject_non_owner(update)
+        return
 
     query = update.callback_query
 
-    if query.data == "get_signal":
+    data = query.data
 
-        await get_signal(
-            update,
-            context
+    if data == "get_signal":
+
+        await get_signal(update)
+
+        return
+
+    if data == "win":
+
+        await query.answer(
+            "WIN ✅"
+        )
+
+        stats["win"] += 1
+
+        await query.message.reply_text(
+            "✅ تم تسجيل WIN.\n\n"
+            + format_stats(),
+            reply_markup=main_keyboard(),
         )
 
         return
 
-    if query.data in {
-        "result_win",
-        "result_loss"
-    }:
+    if data == "loss":
 
-        await result_callback(
-            update,
-            context
+        await query.answer(
+            "LOSS ❌"
+        )
+
+        stats["loss"] += 1
+
+        await query.message.reply_text(
+            "❌ تم تسجيل LOSS.\n\n"
+            + format_stats(),
+            reply_markup=main_keyboard(),
         )
 
         return
@@ -697,23 +579,80 @@ async def button_handler(
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    logger.error(
+    logger.exception(
         "Unhandled exception",
         exc_info=context.error,
     )
 
 
 # =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
+
+    def do_GET(self):
+
+        self.send_response(200)
+
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            b"ZinoQuotexSignalAI is running"
+        )
+
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
+        return
+
+
+def start_health_server() -> None:
+
+    server = HTTPServer(
+        (
+            "0.0.0.0",
+            PORT,
+        ),
+        HealthHandler,
+    )
+
+    logger.info(
+        "Health server listening on port %s",
+        PORT,
+    )
+
+    server.serve_forever()
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
-def main():
+def main() -> None:
+
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
 
     application = (
-        Application.builder()
+        Application
+        .builder()
         .token(BOT_TOKEN)
         .build()
     )
@@ -721,20 +660,20 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start
+            start,
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
-            receive_photo
+            receive_chart,
         )
     )
 
     application.add_handler(
         CallbackQueryHandler(
-            button_handler
+            button_router,
         )
     )
 
@@ -743,12 +682,16 @@ def main():
     )
 
     logger.info(
-        "Zino BotTrader AI is running"
+        "ZinoQuotexSignalAI started"
+    )
+
+    logger.info(
+        "Gemini model: %s",
+        GEMINI_MODEL,
     )
 
     application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
@@ -757,4 +700,4 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
-    main()
+    main()ضش
