@@ -12,25 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 from google import genai
-from telegram import (
-Update,
-InlineKeyboardButton,
-InlineKeyboardMarkup,
-)
-from telegram.ext import (
-Application,
-CommandHandler,
-CallbackQueryHandler,
-ContextTypes,
-MessageHandler,
-filters,
-)
-
-============================================================
-
-CONFIG
-
-============================================================
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -60,12 +43,6 @@ OWNER_ID = int(OWNER_ID_RAW)
 except ValueError:
 raise RuntimeError("OWNER_ID must be an integer")
 
-============================================================
-
-LOGGING
-
-============================================================
-
 logging.basicConfig(
 format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 level=logging.INFO,
@@ -73,19 +50,7 @@ level=logging.INFO,
 
 logger = logging.getLogger("ZinoQuotexSignalAI")
 
-============================================================
-
-TIMEZONE
-
-============================================================
-
 UTC_MINUS_3 = timezone(timedelta(hours=-3))
-
-============================================================
-
-FOREX PAIRS
-
-============================================================
 
 FOREX_PAIRS = [
 "EUR/USD",
@@ -102,21 +67,9 @@ FOREX_PAIRS = [
 "EUR/AUD",
 ]
 
-============================================================
-
-GEMINI CLIENT
-
-============================================================
-
 gemini_client = genai.Client(
 api_key=GEMINI_API_KEY
 )
-
-============================================================
-
-OWNER CHECK
-
-============================================================
 
 def is_owner(update: Update) -> bool:
 user = update.effective_user
@@ -126,29 +79,17 @@ if not user:
 
 return user.id == OWNER_ID
 
-============================================================
-
-PRICE FORMAT
-
-============================================================
-
 def format_price(price: float) -> str:
 if price >= 100:
-decimals = 3
-elif price >= 10:
-decimals = 4
-elif price >= 1:
-decimals = 5
-else:
-decimals = 6
+return f"{price:.3f}"
 
-return f"{price:.{decimals}f}"
+if price >= 10:
+    return f"{price:.4f}"
 
-============================================================
+if price >= 1:
+    return f"{price:.5f}"
 
-TWELVE DATA
-
-============================================================
+return f"{price:.6f}"
 
 async def get_forex_data(
 client: httpx.AsyncClient,
@@ -185,10 +126,6 @@ except Exception as e:
     return None
 
 if not isinstance(data, dict):
-    logger.error(
-        "Invalid Twelve Data response for %s",
-        symbol,
-    )
     return None
 
 if data.get("status") == "error":
@@ -203,7 +140,7 @@ values = data.get("values")
 
 if not values:
     logger.error(
-        "No candle data returned for %s",
+        "No data for %s",
         symbol,
     )
     return None
@@ -240,28 +177,17 @@ try:
     ).reset_index(drop=True)
 
     if len(df) < 20:
-        logger.error(
-            "Not enough candles for %s: %s",
-            symbol,
-            len(df),
-        )
         return None
 
     return df
 
 except Exception as e:
     logger.exception(
-        "Failed to parse candles for %s: %s",
+        "Data parsing failed for %s: %s",
         symbol,
         e,
     )
     return None
-
-============================================================
-
-2 MINUTE CANDLES
-
-============================================================
 
 def make_2m_candles(df: pd.DataFrame):
 work = df.copy()
@@ -290,31 +216,20 @@ result = (
 
 return result
 
-============================================================
-
-ATR
-
-============================================================
-
 def calculate_atr(
 df: pd.DataFrame,
 period: int = 10,
 ):
 previous_close = df["close"].shift(1)
 
-tr1 = (
-    df["high"]
-    - df["low"]
-)
+tr1 = df["high"] - df["low"]
 
 tr2 = (
-    df["high"]
-    - previous_close
+    df["high"] - previous_close
 ).abs()
 
 tr3 = (
-    df["low"]
-    - previous_close
+    df["low"] - previous_close
 ).abs()
 
 true_range = pd.concat(
@@ -330,22 +245,13 @@ return true_range.rolling(
     period
 ).mean()
 
-============================================================
-
-KELTNER CHANNEL
-
-============================================================
-
 def calculate_keltner(
 df: pd.DataFrame,
-ema_period: int = 20,
-atr_period: int = 10,
-multiplier: float = 2.0,
 ):
 middle = (
 df["close"]
 .ewm(
-span=ema_period,
+span=20,
 adjust=False,
 )
 .mean()
@@ -353,28 +259,18 @@ adjust=False,
 
 atr = calculate_atr(
     df,
-    atr_period,
+    10,
 )
 
 upper = middle + (
-    multiplier * atr
+    2.0 * atr
 )
 
 lower = middle - (
-    multiplier * atr
+    2.0 * atr
 )
 
-return (
-    middle,
-    upper,
-    lower,
-)
-
-============================================================
-
-ADX
-
-============================================================
+return middle, upper, lower
 
 def calculate_adx(
 df: pd.DataFrame,
@@ -456,30 +352,15 @@ denominator = (
 
 dx = (
     100
-    * (
-        plus_di - minus_di
-    ).abs()
-    / denominator.replace(
-        0,
-        pd.NA,
-    )
+    * (plus_di - minus_di).abs()
+    / denominator.replace(0, pd.NA)
 )
 
 adx = dx.rolling(
     period
 ).mean()
 
-return (
-    adx,
-    plus_di,
-    minus_di,
-)
-
-============================================================
-
-RSI
-
-============================================================
+return adx, plus_di, minus_di
 
 def calculate_rsi(
 df: pd.DataFrame,
@@ -515,13 +396,7 @@ return 100 - (
     100 / (1 + rs)
 )
 
-============================================================
-
-MARKET STRUCTURE
-
-============================================================
-
-def market_structure(
+def get_market_structure(
 df: pd.DataFrame,
 ):
 if len(df) < 8:
@@ -529,14 +404,14 @@ return "NEUTRAL"
 
 recent = df.tail(8)
 
-first_half = recent.iloc[:4]
-second_half = recent.iloc[4:]
+first = recent.iloc[:4]
+second = recent.iloc[4:]
 
-first_high = first_half["high"].max()
-second_high = second_half["high"].max()
+first_high = first["high"].max()
+second_high = second["high"].max()
 
-first_low = first_half["low"].min()
-second_low = second_half["low"].min()
+first_low = first["low"].min()
+second_low = second["low"].min()
 
 if (
     second_high > first_high
@@ -552,12 +427,6 @@ if (
 
 return "NEUTRAL"
 
-============================================================
-
-PAIR SCORE
-
-============================================================
-
 def score_pair(
 df: pd.DataFrame,
 ):
@@ -567,20 +436,15 @@ return -999, "NEUTRAL"
 work = df.copy()
 
 middle, upper, lower = calculate_keltner(
-    work,
-    20,
-    10,
-    2.0,
+    work
 )
 
 adx, plus_di, minus_di = calculate_adx(
-    work,
-    14,
+    work
 )
 
 rsi = calculate_rsi(
-    work,
-    14,
+    work
 )
 
 work["middle"] = middle
@@ -597,52 +461,38 @@ score = 0
 
 if last["close"] > last["open"]:
     score += 2
-
 elif last["close"] < last["open"]:
     score -= 2
 
-recent_change = (
+change = (
     last["close"]
     - work.iloc[-5]["close"]
 )
 
-if recent_change > 0:
+if change > 0:
     score += 2
-
-elif recent_change < 0:
+elif change < 0:
     score -= 2
 
-structure = market_structure(
+structure = get_market_structure(
     work
 )
 
 if structure == "BULLISH":
     score += 3
-
 elif structure == "BEARISH":
     score -= 3
 
 if pd.notna(last["adx"]):
-
     if last["adx"] >= 20:
-
-        if (
-            last["plus_di"]
-            > last["minus_di"]
-        ):
+        if last["plus_di"] > last["minus_di"]:
             score += 3
-
-        elif (
-            last["minus_di"]
-            > last["plus_di"]
-        ):
+        elif last["minus_di"] > last["plus_di"]:
             score -= 3
 
 if pd.notna(last["middle"]):
-
     if last["close"] > last["middle"]:
         score += 1
-
     elif last["close"] < last["middle"]:
         score -= 1
 
@@ -657,25 +507,20 @@ candle_range = (
 )
 
 if candle_range > 0:
-
     body_ratio = (
         candle_body
         / candle_range
     )
 
     if body_ratio >= 0.55:
-
         if last["close"] > last["open"]:
             score += 2
-
         else:
             score -= 2
 
 if pd.notna(last["rsi"]):
-
     if last["rsi"] >= 70:
         score -= 1
-
     elif last["rsi"] <= 30:
         score += 1
 
@@ -686,12 +531,6 @@ else:
 
 return abs(score), direction
 
-============================================================
-
-CREATE CHART
-
-============================================================
-
 def create_chart(
 df: pd.DataFrame,
 symbol: str,
@@ -699,10 +538,7 @@ symbol: str,
 data = df.tail(40).copy()
 
 middle, upper, lower = calculate_keltner(
-    data,
-    20,
-    10,
-    2.0,
+    data
 )
 
 fig, ax = plt.subplots(
@@ -712,7 +548,6 @@ fig, ax = plt.subplots(
 for i, (_, row) in enumerate(
     data.iterrows()
 ):
-
     open_price = row["open"]
     close_price = row["close"]
     high_price = row["high"]
@@ -725,10 +560,7 @@ for i, (_, row) in enumerate(
 
     ax.plot(
         [i, i],
-        [
-            low_price,
-            high_price,
-        ],
+        [low_price, high_price],
         color=candle_color,
         linewidth=1.2,
     )
@@ -748,8 +580,7 @@ for i, (_, row) in enumerate(
             (
                 high_price
                 - low_price
-            )
-            * 0.02,
+            ) * 0.02,
             0.000001,
         )
 
@@ -762,19 +593,19 @@ for i, (_, row) in enumerate(
         alpha=0.8,
     )
 
-x_values = range(
+x = range(
     len(data)
 )
 
 ax.plot(
-    x_values,
+    x,
     middle,
     linewidth=1.2,
     label="Keltner Middle",
 )
 
 ax.plot(
-    x_values,
+    x,
     upper,
     linewidth=0.8,
     linestyle="--",
@@ -782,7 +613,7 @@ ax.plot(
 )
 
 ax.plot(
-    x_values,
+    x,
     lower,
     linewidth=0.8,
     linestyle="--",
@@ -790,7 +621,7 @@ ax.plot(
 )
 
 ax.set_title(
-    f"{symbol} · 2M"
+    f"{symbol} - 2M"
 )
 
 ax.set_xlabel(
@@ -805,9 +636,7 @@ ax.grid(
     alpha=0.2
 )
 
-ax.legend(
-    loc="upper left"
-)
+ax.legend()
 
 plt.tight_layout()
 
@@ -826,85 +655,74 @@ image.seek(0)
 
 return image
 
-============================================================
-
-GEMINI PROMPT
-
-============================================================
-
 ANALYSIS_PROMPT = """
-أنت محلل تقني متخصص في التداول قصير المدى على شارتات Forex.
+أنت محلل تقني متخصص في التداول قصير المدى على Forex.
 
-حلل صورة الشارت بدقة وركز على آخر حركة سعرية.
+حلل صورة الشارت.
 
-الأولوية:
+ركز بالترتيب على:
 
-1. Price Action
-2. فتح وإغلاق الشموع
-3. High / Low
-4. Market Structure
-5. Breakout أو Failed Breakout
-6. Liquidity Sweep / Rejection
-7. Candle Confirmation
-8. ADX + DMI
-9. Keltner Channel 20/10
-10. RSI كعامل ثانوي
+Price Action
+فتح وإغلاق الشموع
+High و Low
+Market Structure
+Breakout و Failed Breakout
+Liquidity Sweep و Rejection
+Candle Confirmation
+ADX و DMI
+Keltner Channel 20/10
+RSI كعامل ثانوي
 
-القواعد:
+اختر UP أو DOWN فقط.
 
-- يجب اختيار اتجاه واحد فقط: UP أو DOWN.
-- ممنوع NO SIGNAL.
-- ممنوع WAIT.
-- لا تعط اتجاهين.
-- اختر الاتجاه الذي لديه أقوى الأدلة.
-- لا تعتمد على شمعة واحدة فقط إذا كانت بنية السوق تعارضها.
-- راقب Higher High / Higher Low للصعود.
-- راقب Lower High / Lower Low للهبوط.
-- راقب الإغلاق الحقيقي عند الاختراق.
-- راقب Failed Breakout والرفض.
-- استخدم Keltner وADX للتأكيد وليس بدل Price Action.
-- RSI عامل مساعد فقط.
-- حدد تأخير الدخول 1 أو 2 أو 3 دقائق.
-- أعط وقت الدخول فقط، بدون وقت انتهاء.
-- أعط سعر الدخول.
-- أعط مستوى إلغاء واضح.
-- UP: إلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
-- DOWN: إلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
-- السعر بحد أقصى 6 أرقام بعد الفاصلة.
+ممنوع NO SIGNAL.
+ممنوع WAIT.
+ممنوع إعطاء اتجاهين.
 
-أرجع JSON فقط:
+راقب Higher High و Higher Low في الصعود.
+راقب Lower High و Lower Low في الهبوط.
+
+لا تعتمد على شمعة واحدة فقط.
+
+حدد دخولًا بعد 1 أو 2 أو 3 دقائق حسب التحليل.
+
+أعط وقت الدخول فقط بدون وقت انتهاء.
+
+أعط سعر الدخول ومستوى الإلغاء.
+
+في UP:
+الإلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
+
+في DOWN:
+الإلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
+
+السعر بحد أقصى 6 أرقام بعد الفاصلة.
+
+أرجع JSON فقط بهذا الشكل:
 
 {
-"direction": "UP أو DOWN",
-"confidence": 50,
-"entry_delay_minutes": 1,
-"entry_price": 0.0,
-"cancellation_price": 0.0,
+"direction": "UP",
+"confidence": 75,
+"entry_delay_minutes": 2,
+"entry_price": 1.12345,
+"cancellation_price": 1.12280,
 "reason": "سبب مختصر",
-"structure": "BULLISH أو BEARISH أو NEUTRAL",
-"momentum": "BULLISH أو BEARISH أو NEUTRAL"
+"structure": "BULLISH",
+"momentum": "BULLISH"
 }
 """
-
-============================================================
-
-GEMINI ANALYSIS
-
-============================================================
 
 async def analyze_with_gemini(
 image_bytes: bytes,
 symbol: str,
 ):
+prompt = (
+ANALYSIS_PROMPT
++ "\n\nالزوج: "
++ symbol
+)
 
 try:
-
-    prompt = (
-        ANALYSIS_PROMPT
-        + "\n\nالزوج: "
-        + symbol
-    )
-
     response = await asyncio.to_thread(
         gemini_client.models.generate_content,
         model=GEMINI_MODEL,
@@ -957,33 +775,17 @@ try:
         result = json.loads(
             text
         )
-
     except json.JSONDecodeError:
-
         start = text.find("{")
         end = text.rfind("}")
 
-        if (
-            start == -1
-            or end == -1
-            or end <= start
-        ):
+        if start < 0 or end <= start:
             raise RuntimeError(
                 "Gemini did not return valid JSON"
             )
 
         result = json.loads(
-            text[
-                start:end + 1
-            ]
-        )
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-        raise RuntimeError(
-            "Gemini result is not an object"
+            text[start:end + 1]
         )
 
     direction = str(
@@ -1023,11 +825,7 @@ try:
         )
     )
 
-    if delay not in [
-        1,
-        2,
-        3,
-    ]:
+    if delay not in [1, 2, 3]:
         delay = 1
 
     entry_price = float(
@@ -1043,27 +841,6 @@ try:
             0,
         )
     )
-
-    reason = str(
-        result.get(
-            "reason",
-            "Price Action confirmation.",
-        )
-    )
-
-    structure = str(
-        result.get(
-            "structure",
-            "NEUTRAL",
-        )
-    ).upper()
-
-    momentum = str(
-        result.get(
-            "momentum",
-            "NEUTRAL",
-        )
-    ).upper()
 
     if entry_price <= 0:
         raise RuntimeError(
@@ -1081,52 +858,54 @@ try:
         "entry_delay_minutes": delay,
         "entry_price": entry_price,
         "cancellation_price": cancellation_price,
-        "reason": reason,
-        "structure": structure,
-        "momentum": momentum,
+        "reason": str(
+            result.get(
+                "reason",
+                "Price Action confirmation.",
+            )
+        ),
+        "structure": str(
+            result.get(
+                "structure",
+                "NEUTRAL",
+            )
+        ).upper(),
+        "momentum": str(
+            result.get(
+                "momentum",
+                "NEUTRAL",
+            )
+        ).upper(),
     }
 
 except Exception as e:
-
     logger.exception(
-        "Gemini analysis failed for %s: %s",
+        "Gemini analysis failed for %s",
         symbol,
-        e,
+    )
+    raise RuntimeError(
+        f"Gemini analysis failed: {e}"
     )
 
-    raise
-
-============================================================
-
-ENTRY TIME
-
-============================================================
-
-def calculate_entry_time(
-delay_minutes: int,
+def entry_time(
+delay: int,
 ):
 now = datetime.now(
 UTC_MINUS_3
 )
 
-entry = now + timedelta(
-    minutes=delay_minutes
+value = now + timedelta(
+    minutes=delay
 )
 
-return entry.strftime(
+return value.strftime(
     "%H:%M"
 )
-
-============================================================
-
-FIND BEST PAIR
-
-============================================================
 
 async def find_best_pair():
 
 logger.info(
-    "Starting forex pair scan..."
+    "Starting pair scan"
 )
 
 timeout = httpx.Timeout(
@@ -1154,64 +933,60 @@ async with httpx.AsyncClient(
 
 candidates = []
 
-for symbol, df in zip(
+for symbol, data in zip(
     FOREX_PAIRS,
     results,
 ):
 
     if isinstance(
-        df,
+        data,
         Exception,
     ):
         logger.error(
-            "Pair %s failed: %s",
+            "Error for %s: %s",
             symbol,
-            df,
+            data,
         )
         continue
 
-    if df is None:
+    if data is None:
         continue
 
     try:
-
-        candles_2m = make_2m_candles(
-            df
+        candles = make_2m_candles(
+            data
         )
 
         score, direction = score_pair(
-            candles_2m
+            candles
         )
 
-        if score > -999:
+        candidates.append(
+            {
+                "symbol": symbol,
+                "score": score,
+                "direction": direction,
+                "data": candles,
+            }
+        )
 
-            candidates.append(
-                {
-                    "symbol": symbol,
-                    "score": score,
-                    "direction": direction,
-                    "data": candles_2m,
-                }
-            )
-
-            logger.info(
-                "Pair %s score=%s direction=%s",
-                symbol,
-                score,
-                direction,
-            )
+        logger.info(
+            "%s score=%s direction=%s",
+            symbol,
+            score,
+            direction,
+        )
 
     except Exception as e:
-
         logger.exception(
-            "Scoring failed for %s: %s",
+            "Scoring error for %s: %s",
             symbol,
             e,
         )
 
 if not candidates:
     raise RuntimeError(
-        "No valid forex pair data available"
+        "No valid forex data available"
     )
 
 candidates.sort(
@@ -1222,7 +997,7 @@ candidates.sort(
 best = candidates[0]
 
 logger.info(
-    "Best pair selected: %s | score=%s | direction=%s",
+    "Best pair: %s score=%s direction=%s",
     best["symbol"],
     best["score"],
     best["direction"],
@@ -1230,97 +1005,53 @@ logger.info(
 
 return best
 
-============================================================
-
-SIGNAL FORMAT
-
-============================================================
-
 def format_signal(
 symbol: str,
 result: dict,
 ):
-
-direction = result[
-    "direction"
-]
-
-confidence = result[
-    "confidence"
-]
-
-delay = result[
-    "entry_delay_minutes"
-]
-
-entry_price = format_price(
-    result[
-        "entry_price"
-    ]
-)
-
-cancellation_price = format_price(
-    result[
-        "cancellation_price"
-    ]
-)
-
-entry_time = calculate_entry_time(
-    delay
-)
+direction = result["direction"]
 
 if direction == "UP":
-
-    direction_text = (
-        "🟢 UP — شراء"
-    )
+    direction_text = "🟢 UP — شراء"
 
     cancel_text = (
         "إلغاء إذا أغلقت الشمعة تحت "
-        f"{cancellation_price}"
+        + format_price(
+            result["cancellation_price"]
+        )
     )
 
 else:
-
-    direction_text = (
-        "🔴 DOWN — بيع"
-    )
+    direction_text = "🔴 DOWN — بيع"
 
     cancel_text = (
         "إلغاء إذا أغلقت الشمعة فوق "
-        f"{cancellation_price}"
+        + format_price(
+            result["cancellation_price"]
+        )
     )
 
 return (
     "🎓 تحليل زينو\n\n"
-    f"🎯 Confidence: {confidence}%\n"
-    f"📊 {symbol} · ⏱ 2M\n"
-    "━━━━━━━━━━━━━━\n\n"
-    f"🎯 القرار: {direction_text}\n"
-    f"🕐 وقت الدخول: {entry_time}\n"
-    f"⏳ بعد: {delay} دقيقة\n\n"
-    f"💵 سعر الدخول: {entry_price}\n"
-    f"🛑 {cancel_text}\n\n"
-    f"📈 Market Structure: "
-    f"{result['structure']}\n"
-    f"⚡ Momentum: "
-    f"{result['momentum']}\n\n"
-    f"📝 السبب: {result['reason']}"
+    + f"🎯 Confidence: {result['confidence']}%\n"
+    + f"📊 {symbol} · ⏱ 2M\n"
+    + "━━━━━━━━━━━━━━\n\n"
+    + f"🎯 القرار: {direction_text}\n"
+    + f"🕐 وقت الدخول: {entry_time(result['entry_delay_minutes'])}\n"
+    + f"⏳ بعد: {result['entry_delay_minutes']} دقيقة\n\n"
+    + f"💵 سعر الدخول: {format_price(result['entry_price'])}\n"
+    + f"🛑 {cancel_text}\n\n"
+    + f"📈 Market Structure: {result['structure']}\n"
+    + f"⚡ Momentum: {result['momentum']}\n\n"
+    + f"📝 السبب: {result['reason']}"
 )
-
-============================================================
-
-START
-
-============================================================
 
 async def start(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
-
 if not is_owner(update):
-    return
+return
 
 keyboard = [
     [
@@ -1338,25 +1069,18 @@ await update.message.reply_text(
     ),
 )
 
-============================================================
-
-GET SIGNAL
-
-============================================================
-
 async def get_signal(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
-
 if not is_owner(update):
-    return
+return
 
 query = update.callback_query
 
 await query.answer()
 
-processing_message = await query.message.reply_text(
+message = await query.message.reply_text(
     "🔎 جاري فحص الأزواج..."
 )
 
@@ -1364,23 +1088,13 @@ try:
 
     best = await find_best_pair()
 
-    symbol = best[
-        "symbol"
-    ]
+    symbol = best["symbol"]
+    candles = best["data"]
 
-    candles = best[
-        "data"
-    ]
-
-    await processing_message.edit_text(
+    await message.edit_text(
         f"📊 {symbol}\n"
         "🔎 تم اختيار أفضل زوج بعد فحص الأزواج.\n"
-        "📈 جاري إنشاء الشارت وتحليل الحركة..."
-    )
-
-    logger.info(
-        "Creating chart for %s",
-        symbol,
+        "📈 جاري إنشاء الشارت..."
     )
 
     chart = await asyncio.to_thread(
@@ -1402,12 +1116,11 @@ try:
         )
 
     logger.info(
-        "Chart created for %s: %s bytes",
+        "Chart created for %s",
         symbol,
-        len(chart_bytes),
     )
 
-    await processing_message.edit_text(
+    await message.edit_text(
         f"📊 {symbol}\n"
         "🧠 جاري تحليل الشارت..."
     )
@@ -1417,90 +1130,61 @@ try:
         symbol,
     )
 
-    signal_text = format_signal(
+    text = format_signal(
         symbol,
         result,
     )
 
-    await processing_message.delete()
+    await message.delete()
 
     await query.message.reply_photo(
         photo=io.BytesIO(
             chart_bytes
         ),
-        caption=signal_text,
-    )
-
-    logger.info(
-        "Signal sent successfully for %s",
-        symbol,
+        caption=text,
     )
 
 except Exception as e:
 
     logger.exception(
-        "Get Signal failed: %s",
-        e,
+        "Get Signal failed"
     )
 
-    error_text = (
+    error = (
         "❌ حدث خطأ أثناء التحليل:\n\n"
-        f"{str(e)[:1000]}"
+        + str(e)[:1000]
     )
 
     try:
-
-        await processing_message.edit_text(
-            error_text
+        await message.edit_text(
+            error
         )
-
     except Exception:
-
         await query.message.reply_text(
-            error_text
+            error
         )
-
-============================================================
-
-TEXT
-
-============================================================
 
 async def handle_text(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
-
 if not is_owner(update):
-    return
+return
 
 await update.message.reply_text(
     "اضغط 🎯 Get Signal للحصول على الإشارة."
 )
 
-============================================================
-
-PHOTO
-
-============================================================
-
 async def handle_photo(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
-
 if not is_owner(update):
-    return
+return
 
 await update.message.reply_text(
     "🎯 استخدم Get Signal ليقوم البوت بفحص الأزواج وتحليل الشارت تلقائيًا."
 )
-
-============================================================
-
-HEALTH SERVER
-
-============================================================
 
 async def health(
 request,
@@ -1531,8 +1215,8 @@ await runner.setup()
 
 site = web.TCPSite(
     runner,
-    host="0.0.0.0",
-    port=PORT,
+    "0.0.0.0",
+    PORT,
 )
 
 await site.start()
@@ -1543,12 +1227,6 @@ logger.info(
 )
 
 return runner
-
-============================================================
-
-MAIN
-
-============================================================
 
 async def main():
 
@@ -1617,22 +1295,13 @@ finally:
 
     await health_runner.cleanup()
 
-============================================================
-
-RUN
-
-============================================================
-
 if name == "main":
 
 try:
-
     asyncio.run(
         main()
     )
-
 except KeyboardInterrupt:
-
     logger.info(
         "Bot stopped"
 )
