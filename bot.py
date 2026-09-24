@@ -6,12 +6,7 @@ import threading
 import asyncio
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -87,6 +82,15 @@ client = genai.Client(
 
 
 # =========================================================
+# TIMEZONE
+# =========================================================
+
+UTC_MINUS_3 = timezone(
+    timedelta(hours=-3)
+)
+
+
+# =========================================================
 # STATS
 # =========================================================
 
@@ -94,16 +98,6 @@ stats = {
     "win": 0,
     "loss": 0,
 }
-
-
-# =========================================================
-# TIMEZONE
-# UTC-3
-# =========================================================
-
-UTC_MINUS_3 = timezone(
-    timedelta(hours=-3)
-)
 
 
 # =========================================================
@@ -173,9 +167,9 @@ async def start(
         "🎓 ZinoQuotexSignalAI\n\n"
 
         "📸 أرسل Screenshot للشارت.\n"
-        "سيتم تحليلها مباشرة بدون Get Signal.\n\n"
+        "سيتم التحليل مباشرة.\n\n"
 
-        "🕐 التوقيت المعروض: UTC-3",
+        "🕐 وقت الدخول يظهر بتوقيت UTC-3.",
 
         reply_markup=main_keyboard(),
     )
@@ -202,12 +196,15 @@ def extract_json(
             lines
             and lines[-1].strip() == "```"
         ):
+
             lines = lines[:-1]
 
         text = "\n".join(lines).strip()
 
+
     start = text.find("{")
     end = text.rfind("}")
+
 
     if start == -1 or end == -1:
 
@@ -215,12 +212,9 @@ def extract_json(
             "Gemini did not return valid JSON"
         )
 
-    json_text = text[
-        start:end + 1
-    ]
 
     return json.loads(
-        json_text
+        text[start:end + 1]
     )
 
 
@@ -236,9 +230,8 @@ def analyze_chart(
 You are a simple BotTrader-style chart analysis assistant
 for Quotex.
 
-Analyze ONLY the screenshot supplied with this request.
+Analyze ONLY the current screenshot.
 
-IMPORTANT:
 Every screenshot is a completely new analysis.
 
 Never use:
@@ -250,28 +243,20 @@ Never use:
 
 Analyze the current screenshot independently.
 
-Read the visible chart carefully.
+Read only information that is actually visible.
 
 Identify:
 
 1. Asset / currency pair.
 2. Visible chart timeframe.
-3. Moving average direction ONLY if a moving average is visible.
-4. Technical-indicator direction ONLY from indicators actually visible.
+3. Moving average direction only if a moving average is visible.
+4. Technical-indicator direction only from indicators actually visible.
 5. Recent candle direction.
 6. Recent price action.
 7. Market structure.
 8. Breakout or rejection only when clearly visible.
 
-Keep the result simple and similar to this format:
-
-Asset
-Time
-Broker
-Moving average
-Technical indicators
-Trading signal
-Confidence
+Keep the analysis simple.
 
 Do NOT invent indicators.
 
@@ -287,11 +272,11 @@ Do NOT mention ADX unless it is actually visible.
 
 Do NOT mention Support/Resistance unless clearly visible.
 
-Do NOT use hidden indicators.
+Do NOT use hidden or imaginary indicators.
 
 Do NOT create information that cannot be read from the screenshot.
 
-The final signal MUST be exactly one of:
+The final signal MUST be exactly:
 
 STRONG BUY
 
@@ -306,12 +291,45 @@ Do not alternate BUY and SELL artificially.
 Choose the direction from the strongest visible evidence
 in THIS screenshot.
 
-Also return a confidence number from 50 to 99.
+CONFIDENCE:
 
-IMPORTANT:
+Return an integer from 50 to 99.
+
 Confidence is an analysis-confidence score.
 It is NOT a guaranteed win probability.
-Do not inflate the number without strong visible evidence.
+
+Do not inflate the confidence without strong visible evidence.
+
+
+IMPORTANT ENTRY TIME RULE:
+
+Do NOT return the time when the screenshot was sent.
+
+Determine the appropriate ENTRY DELAY from the current
+chart analysis.
+
+Choose ONLY:
+
+1 minute
+
+or
+
+2 minutes
+
+Use 1 minute when the setup is already sufficiently
+confirmed for the next candle.
+
+Use 2 minutes when an additional candle confirmation
+is more appropriate.
+
+Return entry_delay as an integer:
+
+1
+
+or
+
+2
+
 
 Return ONLY valid JSON.
 
@@ -324,7 +342,8 @@ Use exactly this structure:
   "moving_average": "Sell",
   "technical_indicators": "Strong Sell",
   "signal": "STRONG SELL",
-  "confidence": 82
+  "confidence": 82,
+  "entry_delay": 2
 }
 
 Rules:
@@ -345,7 +364,7 @@ Return only:
 "Not Visible"
 
 technical_indicators:
-Return only a concise description such as:
+Return a concise description such as:
 "Strong Buy"
 "Buy"
 "Strong Sell"
@@ -361,6 +380,9 @@ or
 
 confidence:
 Integer from 50 to 99.
+
+entry_delay:
+Integer 1 or 2.
 """
 
 
@@ -369,15 +391,19 @@ Integer from 50 to 99.
         model=GEMINI_MODEL,
 
         contents=[
+
             types.Part.from_bytes(
                 data=image_bytes,
                 mime_type="image/jpeg",
             ),
+
             prompt,
         ],
 
         config=types.GenerateContentConfig(
+
             temperature=0.1,
+
             response_mime_type="application/json",
         ),
     )
@@ -416,9 +442,11 @@ Integer from 50 to 99.
     try:
 
         confidence = int(
-            data.get(
-                "confidence"
-            )
+            data.get("confidence")
+        )
+
+        entry_delay = int(
+            data.get("entry_delay")
         )
 
     except (
@@ -427,11 +455,21 @@ Integer from 50 to 99.
     ):
 
         raise ValueError(
-            "Gemini returned an invalid confidence"
+            "Gemini returned invalid confidence or entry delay"
         )
 
 
-    confidence = max(
+    if entry_delay not in (
+        1,
+        2,
+    ):
+
+        raise ValueError(
+            "Gemini returned an invalid entry delay"
+        )
+
+
+    data["confidence"] = max(
         50,
         min(
             99,
@@ -439,8 +477,8 @@ Integer from 50 to 99.
         ),
     )
 
+    data["entry_delay"] = entry_delay
 
-    data["confidence"] = confidence
 
     return data
 
@@ -509,9 +547,26 @@ def format_signal(
     )
 
 
-    signal_time = datetime.now(
-        UTC_MINUS_3
-    ).strftime(
+    entry_delay = int(
+        data.get(
+            "entry_delay",
+            1,
+        )
+    )
+
+
+    # حساب وقت الدخول الحقيقي
+    entry_time = (
+        datetime.now(
+            UTC_MINUS_3
+        )
+        + timedelta(
+            minutes=entry_delay
+        )
+    )
+
+
+    entry_time_text = entry_time.strftime(
         "%H:%M:%S"
     )
 
@@ -529,28 +584,24 @@ def format_signal(
 
         f"📊 {asset}\n"
 
-        f"⏱ Chart Time: {timeframe}\n"
-
-        f"🕐 Signal Time: "
-        f"{signal_time} UTC-3\n"
-
-        f"🏦 Broker: {broker}\n"
-
-        f"\n"
+        f"⏱ Chart Time: {timeframe}\n\n"
 
         f"📈 Moving average: "
         f"{moving_average}\n"
 
         f"📊 Technical indicators: "
-        f"{technical_indicators}\n"
+        f"{technical_indicators}\n\n"
 
-        f"\n"
-
-        f"🎯 Trading signal from bot: "
+        f"🎯 Trading signal: "
         f"{emoji} {signal}\n"
 
         f"📊 Confidence: "
-        f"{confidence}%"
+        f"{confidence}%\n\n"
+
+        f"🕐 وقت الدخول: "
+        f"{entry_time_text} UTC-3\n\n"
+
+        f"🏦 Broker: {broker}"
     )
 
 
@@ -600,7 +651,7 @@ async def receive_chart(
     image_data = image_bytes.getvalue()
 
 
-    # تحليل مباشر فور إرسال الصورة
+    # التحليل يبدأ مباشرة
     status_message = await update.message.reply_text(
         "🔎 جاري تحليل الشارت مباشرة..."
     )
@@ -680,7 +731,7 @@ def format_stats() -> str:
 
 
 # =========================================================
-# WIN / LOSS BUTTONS
+# WIN / LOSS
 # =========================================================
 
 async def button_router(
