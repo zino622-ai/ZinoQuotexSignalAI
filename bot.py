@@ -1,26 +1,32 @@
 import os
 import io
 import json
-import base64
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 import httpx
-from aiohttp import web
+import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import pandas as pd
+from aiohttp import web
 from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+logging.basicConfig(
+format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+level=logging.INFO,
+)
+
+logger = logging.getLogger("ZinoQuotexSignalAI")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID_RAW = os.getenv("OWNER_ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
@@ -32,27 +38,17 @@ raise RuntimeError("GEMINI_API_KEY is missing")
 if not OWNER_ID_RAW:
 raise RuntimeError("OWNER_ID is missing")
 
-if not GEMINI_MODEL:
-raise RuntimeError("GEMINI_MODEL is missing")
-
 if not TWELVE_DATA_API_KEY:
 raise RuntimeError("TWELVE_DATA_API_KEY is missing")
 
 try:
 OWNER_ID = int(OWNER_ID_RAW)
-except ValueError:
-raise RuntimeError("OWNER_ID must be an integer")
+except ValueError as exc:
+raise RuntimeError("OWNER_ID must be an integer") from exc
 
-logging.basicConfig(
-format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-level=logging.INFO,
-)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-logger = logging.getLogger("ZinoQuotexSignalAI")
-
-UTC_MINUS_3 = timezone(timedelta(hours=-3))
-
-FOREX_PAIRS = [
+PAIRS = [
 "EUR/USD",
 "GBP/USD",
 "USD/JPY",
@@ -67,35 +63,27 @@ FOREX_PAIRS = [
 "EUR/AUD",
 ]
 
-gemini_client = genai.Client(
-api_key=GEMINI_API_KEY
-)
+TIMEFRAME = "2M"
+MAX_SCAN_CONCURRENCY = 4
 
 def is_owner(update: Update) -> bool:
 user = update.effective_user
+return bool(user and user.id == OWNER_ID)
 
-if not user:
-    return False
+def format_price(value) -> str:
+try:
+number = float(value)
+except (TypeError, ValueError):
+return str(value)
 
-return user.id == OWNER_ID
+result = f"{number:.6f}".rstrip("0").rstrip(".")
 
-def format_price(price: float) -> str:
-if price >= 100:
-return f"{price:.3f}"
+if not result:
+    return "0"
 
-if price >= 10:
-    return f"{price:.4f}"
+return result
 
-if price >= 1:
-    return f"{price:.5f}"
-
-return f"{price:.6f}"
-
-async def get_forex_data(
-client: httpx.AsyncClient,
-symbol: str,
-outputsize: int = 80,
-):
+async def get_forex_data(symbol: str, outputsize: int = 100) -> pd.DataFrame:
 url = "https://api.twelvedata.com/time_series"
 
 params = {
@@ -106,176 +94,126 @@ params = {
     "format": "JSON",
 }
 
-try:
-    response = await client.get(
-        url,
-        params=params,
-        timeout=15.0,
-    )
-
+async with httpx.AsyncClient(timeout=20.0) as client:
+    response = await client.get(url, params=params)
     response.raise_for_status()
-
     data = response.json()
 
-except Exception as e:
-    logger.error(
-        "Twelve Data request failed for %s: %s",
-        symbol,
-        e,
-    )
-    return None
-
-if not isinstance(data, dict):
-    return None
-
 if data.get("status") == "error":
-    logger.error(
-        "Twelve Data error for %s: %s",
-        symbol,
-        data.get("message"),
+    raise RuntimeError(
+        data.get("message", f"Twelve Data error for {symbol}")
     )
-    return None
 
 values = data.get("values")
 
 if not values:
-    logger.error(
-        "No data for %s",
-        symbol,
-    )
-    return None
+    raise RuntimeError(f"No market data for {symbol}")
 
-try:
-    df = pd.DataFrame(values)
+df = pd.DataFrame(values)
 
-    df["datetime"] = pd.to_datetime(
-        df["datetime"]
-    )
+required = [
+    "datetime",
+    "open",
+    "high",
+    "low",
+    "close",
+]
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
+if any(column not in df.columns for column in required):
+    raise RuntimeError(f"Invalid market data for {symbol}")
 
-    df = df.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
+for column in ["open", "high", "low", "close"]:
+    df[column] = pd.to_numeric(
+        df[column],
+        errors="coerce",
     )
 
-    df = df.sort_values(
-        "datetime"
-    ).reset_index(drop=True)
-
-    if len(df) < 20:
-        return None
-
-    return df
-
-except Exception as e:
-    logger.exception(
-        "Data parsing failed for %s: %s",
-        symbol,
-        e,
-    )
-    return None
-
-def make_2m_candles(df: pd.DataFrame):
-work = df.copy()
-
-work["datetime"] = pd.to_datetime(
-    work["datetime"]
+df["datetime"] = pd.to_datetime(
+    df["datetime"],
+    errors="coerce",
 )
 
-work = work.set_index(
+df = df.dropna(
+    subset=required
+).sort_values(
     "datetime"
+).reset_index(
+    drop=True
 )
 
-result = (
-    work.resample("2min")
-    .agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-        }
+if len(df) < 40:
+    raise RuntimeError(
+        f"Not enough candles for {symbol}"
     )
-    .dropna()
-    .reset_index()
-)
+
+return df
+
+def make_2m_candles(df: pd.DataFrame) -> pd.DataFrame:
+data = df.copy().set_index("datetime")
+
+result = data.resample(
+    "2min",
+    label="left",
+    closed="left",
+).agg(
+    {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+).dropna().reset_index()
 
 return result
 
 def calculate_atr(
 df: pd.DataFrame,
 period: int = 10,
-):
-previous_close = df["close"].shift(1)
+) -> pd.Series:
 
-tr1 = df["high"] - df["low"]
+high = df["high"]
+low = df["low"]
+close = df["close"]
 
-tr2 = (
-    df["high"] - previous_close
-).abs()
-
-tr3 = (
-    df["low"] - previous_close
-).abs()
+previous_close = close.shift(1)
 
 true_range = pd.concat(
     [
-        tr1,
-        tr2,
-        tr3,
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
     ],
     axis=1,
 ).max(axis=1)
 
-return true_range.rolling(
-    period
-).mean()
+return true_range.rolling(period).mean()
 
 def calculate_keltner(
 df: pd.DataFrame,
+ema_period: int = 20,
+atr_period: int = 10,
 ):
-middle = (
-df["close"]
-.ewm(
-span=20,
-adjust=False,
-)
-.mean()
-)
+
+middle = df["close"].ewm(
+    span=ema_period,
+    adjust=False,
+).mean()
 
 atr = calculate_atr(
     df,
-    10,
+    atr_period,
 )
 
-upper = middle + (
-    2.0 * atr
-)
+upper = middle + (2.0 * atr)
+lower = middle - (2.0 * atr)
 
-lower = middle - (
-    2.0 * atr
-)
-
-return middle, upper, lower
+return middle, upper, lower, atr
 
 def calculate_adx(
 df: pd.DataFrame,
 period: int = 14,
 ):
+
 high = df["high"]
 low = df["low"]
 close = df["close"]
@@ -284,774 +222,891 @@ up_move = high.diff()
 down_move = -low.diff()
 
 plus_dm = pd.Series(
-    0.0,
+    np.where(
+        (up_move > down_move) & (up_move > 0),
+        up_move,
+        0.0,
+    ),
     index=df.index,
 )
 
 minus_dm = pd.Series(
-    0.0,
+    np.where(
+        (down_move > up_move) & (down_move > 0),
+        down_move,
+        0.0,
+    ),
     index=df.index,
 )
 
-plus_condition = (
-    (up_move > down_move)
-    & (up_move > 0)
-)
-
-minus_condition = (
-    (down_move > up_move)
-    & (down_move > 0)
-)
-
-plus_dm.loc[
-    plus_condition
-] = up_move.loc[
-    plus_condition
-]
-
-minus_dm.loc[
-    minus_condition
-] = down_move.loc[
-    minus_condition
-]
-
 previous_close = close.shift(1)
 
-tr = pd.concat(
+true_range = pd.concat(
     [
         high - low,
-        (
-            high - previous_close
-        ).abs(),
-        (
-            low - previous_close
-        ).abs(),
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
     ],
     axis=1,
 ).max(axis=1)
 
-atr = tr.rolling(
-    period
-).mean()
+atr = true_range.rolling(period).mean()
 
 plus_di = (
     100
     * plus_dm.rolling(period).mean()
-    / atr
+    / atr.replace(0, np.nan)
 )
 
 minus_di = (
     100
     * minus_dm.rolling(period).mean()
-    / atr
+    / atr.replace(0, np.nan)
 )
 
 denominator = (
     plus_di + minus_di
-)
+).replace(0, np.nan)
 
 dx = (
     100
     * (plus_di - minus_di).abs()
-    / denominator.replace(0, pd.NA)
+    / denominator
 )
 
-adx = dx.rolling(
-    period
-).mean()
+adx = dx.rolling(period).mean()
 
 return adx, plus_di, minus_di
 
 def calculate_rsi(
 df: pd.DataFrame,
 period: int = 14,
-):
+) -> pd.Series:
+
 delta = df["close"].diff()
 
-gain = delta.clip(
-    lower=0
-)
+gain = delta.clip(lower=0)
+loss = -delta.clip(upper=0)
 
-loss = -delta.clip(
-    upper=0
-)
-
-avg_gain = gain.rolling(
-    period
-).mean()
-
-avg_loss = loss.rolling(
-    period
-).mean()
+average_gain = gain.rolling(period).mean()
+average_loss = loss.rolling(period).mean()
 
 rs = (
-    avg_gain
-    / avg_loss.replace(
-        0,
-        pd.NA,
-    )
+    average_gain
+    / average_loss.replace(0, np.nan)
 )
 
-return 100 - (
+rsi = 100 - (
     100 / (1 + rs)
+)
+
+rsi = rsi.where(
+    average_loss != 0,
+    100,
+)
+
+rsi = rsi.where(
+    ~(
+        (average_gain == 0)
+        & (average_loss == 0)
+    ),
+    50,
+)
+
+return rsi
+
+def candle_body(candle) -> float:
+return abs(
+float(candle["close"])
+- float(candle["open"])
 )
 
 def get_market_structure(
 df: pd.DataFrame,
-):
+) -> str:
+
 if len(df) < 8:
-return "NEUTRAL"
+    return "NEUTRAL"
 
-recent = df.tail(8)
+recent = df.tail(8).reset_index(drop=True)
 
-first = recent.iloc[:4]
-second = recent.iloc[4:]
+highs = recent["high"]
+lows = recent["low"]
+closes = recent["close"]
 
-first_high = first["high"].max()
-second_high = second["high"].max()
+higher_high = (
+    highs.iloc[-1]
+    > highs.iloc[-3]
+)
 
-first_low = first["low"].min()
-second_low = second["low"].min()
+higher_low = (
+    lows.iloc[-1]
+    > lows.iloc[-3]
+)
+
+lower_high = (
+    highs.iloc[-1]
+    < highs.iloc[-3]
+)
+
+lower_low = (
+    lows.iloc[-1]
+    < lows.iloc[-3]
+)
 
 if (
-    second_high > first_high
-    and second_low > first_low
+    higher_high
+    and higher_low
+    and closes.iloc[-1]
+    >= closes.iloc[-2]
 ):
     return "BULLISH"
 
 if (
-    second_high < first_high
-    and second_low < first_low
+    lower_high
+    and lower_low
+    and closes.iloc[-1]
+    <= closes.iloc[-2]
 ):
     return "BEARISH"
 
-return "NEUTRAL"
+return "RANGE"
 
 def score_pair(
 df: pd.DataFrame,
 ):
-if len(df) < 40:
-return -999, "NEUTRAL"
 
-work = df.copy()
+middle, upper, lower, atr = calculate_keltner(df)
 
-middle, upper, lower = calculate_keltner(
-    work
-)
+adx, plus_di, minus_di = calculate_adx(df)
 
-adx, plus_di, minus_di = calculate_adx(
-    work
-)
+rsi = calculate_rsi(df)
 
-rsi = calculate_rsi(
-    work
-)
+last = df.iloc[-1]
+previous = df.iloc[-2]
 
-work["middle"] = middle
-work["upper"] = upper
-work["lower"] = lower
-work["adx"] = adx
-work["plus_di"] = plus_di
-work["minus_di"] = minus_di
-work["rsi"] = rsi
-
-last = work.iloc[-1]
-
-score = 0
+direction_score = 0.0
+reasons = []
 
 if last["close"] > last["open"]:
-    score += 2
+    direction_score += 1.0
+    reasons.append(
+        "latest candle bullish"
+    )
+
 elif last["close"] < last["open"]:
-    score -= 2
+    direction_score -= 1.0
+    reasons.append(
+        "latest candle bearish"
+    )
 
-change = (
-    last["close"]
-    - work.iloc[-5]["close"]
-)
+if last["close"] > previous["high"]:
+    direction_score += 2.0
+    reasons.append(
+        "bullish breakout"
+    )
 
-if change > 0:
-    score += 2
-elif change < 0:
-    score -= 2
+elif last["close"] < previous["low"]:
+    direction_score -= 2.0
+    reasons.append(
+        "bearish breakout"
+    )
 
-structure = get_market_structure(
-    work
-)
+structure = get_market_structure(df)
 
 if structure == "BULLISH":
-    score += 3
+    direction_score += 2.0
+    reasons.append(
+        "bullish market structure"
+    )
+
 elif structure == "BEARISH":
-    score -= 3
+    direction_score -= 2.0
+    reasons.append(
+        "bearish market structure"
+    )
 
-if pd.notna(last["adx"]):
-    if last["adx"] >= 20:
-        if last["plus_di"] > last["minus_di"]:
-            score += 3
-        elif last["minus_di"] > last["plus_di"]:
-            score -= 3
+if (
+    pd.notna(plus_di.iloc[-1])
+    and pd.notna(minus_di.iloc[-1])
+):
 
-if pd.notna(last["middle"]):
-    if last["close"] > last["middle"]:
-        score += 1
-    elif last["close"] < last["middle"]:
-        score -= 1
+    if plus_di.iloc[-1] > minus_di.iloc[-1]:
+        direction_score += 1.5
+        reasons.append(
+            "ADX directional pressure up"
+        )
 
-candle_body = abs(
-    last["close"]
-    - last["open"]
-)
+    elif minus_di.iloc[-1] > plus_di.iloc[-1]:
+        direction_score -= 1.5
+        reasons.append(
+            "ADX directional pressure down"
+        )
 
-candle_range = (
-    last["high"]
-    - last["low"]
+if (
+    pd.notna(adx.iloc[-1])
+    and adx.iloc[-1] >= 18
+):
+    reasons.append(
+        "ADX trend strength present"
+    )
+
+if (
+    pd.notna(upper.iloc[-1])
+    and last["close"] >= upper.iloc[-1]
+):
+    direction_score -= 0.5
+    reasons.append(
+        "near Keltner upper band"
+    )
+
+elif (
+    pd.notna(lower.iloc[-1])
+    and last["close"] <= lower.iloc[-1]
+):
+    direction_score += 0.5
+    reasons.append(
+        "near Keltner lower band"
+    )
+
+if pd.notna(rsi.iloc[-1]):
+
+    if rsi.iloc[-1] >= 70:
+        direction_score -= 0.5
+        reasons.append("RSI high")
+
+    elif rsi.iloc[-1] <= 30:
+        direction_score += 0.5
+        reasons.append("RSI low")
+
+body = candle_body(last)
+
+candle_range = float(
+    last["high"] - last["low"]
 )
 
 if candle_range > 0:
-    body_ratio = (
-        candle_body
-        / candle_range
-    )
-
-    if body_ratio >= 0.55:
-        if last["close"] > last["open"]:
-            score += 2
-        else:
-            score -= 2
-
-if pd.notna(last["rsi"]):
-    if last["rsi"] >= 70:
-        score -= 1
-    elif last["rsi"] <= 30:
-        score += 1
-
-if score >= 0:
-    direction = "UP"
+    body_ratio = body / candle_range
 else:
-    direction = "DOWN"
+    body_ratio = 0.0
 
-return abs(score), direction
+if body_ratio >= 0.55:
+
+    if last["close"] > last["open"]:
+        direction_score += 1.0
+        reasons.append(
+            "strong bullish candle close"
+        )
+
+    elif last["close"] < last["open"]:
+        direction_score -= 1.0
+        reasons.append(
+            "strong bearish candle close"
+        )
+
+return {
+    "score": abs(direction_score),
+    "raw_score": direction_score,
+    "direction": (
+        "UP"
+        if direction_score >= 0
+        else "DOWN"
+    ),
+    "structure": structure,
+    "adx": (
+        float(adx.iloc[-1])
+        if pd.notna(adx.iloc[-1])
+        else 0.0
+    ),
+    "rsi": (
+        float(rsi.iloc[-1])
+        if pd.notna(rsi.iloc[-1])
+        else 50.0
+    ),
+    "atr": (
+        float(atr.iloc[-1])
+        if pd.notna(atr.iloc[-1])
+        else 0.0
+    ),
+    "reasons": reasons[-5:],
+}
 
 def create_chart(
 df: pd.DataFrame,
 symbol: str,
-):
-data = df.tail(40).copy()
+) -> bytes:
 
-middle, upper, lower = calculate_keltner(
-    data
-)
+data = df.tail(40).reset_index(drop=True)
+
+middle, upper, lower, _ = calculate_keltner(data)
 
 fig, ax = plt.subplots(
-    figsize=(12, 6)
+    figsize=(12, 6),
+    dpi=130,
 )
 
-for i, (_, row) in enumerate(
-    data.iterrows()
-):
-    open_price = row["open"]
-    close_price = row["close"]
-    high_price = row["high"]
-    low_price = row["low"]
-
-    if close_price >= open_price:
-        candle_color = "green"
-    else:
-        candle_color = "red"
+for index, row in data.iterrows():
 
     ax.plot(
-        [i, i],
-        [low_price, high_price],
-        color=candle_color,
-        linewidth=1.2,
+        [index, index],
+        [row["low"], row["high"]],
+        linewidth=1,
     )
 
-    bottom = min(
-        open_price,
-        close_price,
+    ax.plot(
+        [index, index],
+        [row["open"], row["close"]],
+        linewidth=5,
     )
-
-    height = abs(
-        close_price
-        - open_price
-    )
-
-    if height == 0:
-        height = max(
-            (
-                high_price
-                - low_price
-            ) * 0.02,
-            0.000001,
-        )
-
-    ax.bar(
-        i,
-        height,
-        bottom=bottom,
-        width=0.65,
-        color=candle_color,
-        alpha=0.8,
-    )
-
-x = range(
-    len(data)
-)
 
 ax.plot(
-    x,
-    middle,
+    middle.values,
     linewidth=1.2,
-    label="Keltner Middle",
+    label="Keltner Mid",
 )
 
 ax.plot(
-    x,
-    upper,
-    linewidth=0.8,
-    linestyle="--",
+    upper.values,
+    linewidth=1.0,
     label="Keltner Upper",
 )
 
 ax.plot(
-    x,
-    lower,
-    linewidth=0.8,
-    linestyle="--",
+    lower.values,
+    linewidth=1.0,
     label="Keltner Lower",
 )
 
 ax.set_title(
-    f"{symbol} - 2M"
+    f"ZinoQuotexSignalAI — {symbol} — 2M"
 )
 
 ax.set_xlabel(
-    "Candles"
+    "2-minute candles"
 )
 
-ax.set_ylabel(
-    "Price"
+ax.set_ylabel("Price")
+
+ax.grid(alpha=0.2)
+
+ax.legend(
+    loc="upper left"
 )
 
-ax.grid(
-    alpha=0.2
-)
+fig.tight_layout()
 
-ax.legend()
+output = io.BytesIO()
 
-plt.tight_layout()
-
-image = io.BytesIO()
-
-plt.savefig(
-    image,
+fig.savefig(
+    output,
     format="png",
-    dpi=150,
     bbox_inches="tight",
 )
 
 plt.close(fig)
 
-image.seek(0)
+output.seek(0)
 
-return image
+return output.getvalue()
 
 ANALYSIS_PROMPT = """
-أنت محلل تقني متخصص في التداول قصير المدى على Forex.
+You are the technical analysis engine for a private Quotex signal bot.
 
-حلل صورة الشارت.
+Analyze the supplied 2-minute Forex chart and calculated market data.
 
-ركز بالترتيب على:
+Priority:
 
-Price Action
-فتح وإغلاق الشموع
-High و Low
-Market Structure
-Breakout و Failed Breakout
-Liquidity Sweep و Rejection
-Candle Confirmation
-ADX و DMI
-Keltner Channel 20/10
-RSI كعامل ثانوي
+1. Candle open/close and latest candle strength.
+2. Recent lows/highs and breakouts or failed breakouts.
+3. Market structure: higher highs/higher lows or lower highs/lower lows.
+4. Liquidity sweep/rejection when visible.
+5. Candle confirmation.
+6. Keltner Channel 20/10.
+7. ADX 14/14 and DI direction.
+8. RSI 14 only as a secondary filter.
 
-اختر UP أو DOWN فقط.
+Rules:
 
-ممنوع NO SIGNAL.
-ممنوع WAIT.
-ممنوع إعطاء اتجاهين.
+- Return exactly one direction: UP or DOWN.
+- Never return NO SIGNAL.
+- Never return WAIT.
+- Choose the direction with the strongest evidence.
+- Entry delay must be an integer from 1 to 3 minutes.
+- Prefer 1 minute when confirmation is already strong.
+- Use 2 minutes when the next candle needs confirmation.
+- Use 3 minutes only when additional confirmation is clearly needed.
+- Entry price must be based on the latest available close.
+- Cancellation level must be a nearby technical invalidation level.
+- For UP: cancel if a candle closes below the cancellation level.
+- For DOWN: cancel if a candle closes above the cancellation level.
+- Price must use at most 6 decimal places.
+- Do not invent indicators that are not visible or provided.
 
-راقب Higher High و Higher Low في الصعود.
-راقب Lower High و Lower Low في الهبوط.
-
-لا تعتمد على شمعة واحدة فقط.
-
-حدد دخولًا بعد 1 أو 2 أو 3 دقائق حسب التحليل.
-
-أعط وقت الدخول فقط بدون وقت انتهاء.
-
-أعط سعر الدخول ومستوى الإلغاء.
-
-في UP:
-الإلغاء إذا أغلقت شمعة تحت مستوى الإلغاء.
-
-في DOWN:
-الإلغاء إذا أغلقت شمعة فوق مستوى الإلغاء.
-
-السعر بحد أقصى 6 أرقام بعد الفاصلة.
-
-أرجع JSON فقط بهذا الشكل:
+Return ONLY valid JSON:
 
 {
 "direction": "UP",
 "confidence": 75,
-"entry_delay_minutes": 2,
-"entry_price": 1.12345,
-"cancellation_price": 1.12280,
-"reason": "سبب مختصر",
-"structure": "BULLISH",
-"momentum": "BULLISH"
+"entry_delay": 2,
+"entry_price": 1.234567,
+"cancellation_price": 1.234000,
+"market_structure": "BULLISH",
+"momentum": "BULLISH",
+"reason": "Short technical reason"
 }
 """
 
-async def analyze_with_gemini(
-image_bytes: bytes,
-symbol: str,
+def extract_json(text: str):
+
+if not text:
+    raise ValueError(
+        "Gemini returned an empty response"
+    )
+
+cleaned = text.strip()
+
+if cleaned.startswith("```"):
+    cleaned = cleaned.replace(
+        "```json",
+        "",
+        1,
+    )
+
+    cleaned = cleaned.replace(
+        "```",
+        "",
+    ).strip()
+
+start = cleaned.find("{")
+end = cleaned.rfind("}")
+
+if (
+    start == -1
+    or end == -1
+    or end <= start
 ):
-prompt = (
-ANALYSIS_PROMPT
-+ "\n\nالزوج: "
-+ symbol
+    raise ValueError(
+        "Gemini did not return valid JSON"
+    )
+
+return json.loads(
+    cleaned[start:end + 1]
+)
+
+async def analyze_with_gemini(
+chart_bytes: bytes,
+symbol: str,
+metrics: dict,
+):
+
+image_part = {
+    "inline_data": {
+        "mime_type": "image/png",
+        "data": chart_bytes,
+    }
+}
+
+context = (
+    f"Pair: {symbol}\n"
+    f"Timeframe: 2M\n"
+    f"Local pre-score direction: "
+    f"{metrics['direction']}\n"
+    f"Market structure: "
+    f"{metrics['structure']}\n"
+    f"ADX: {metrics['adx']:.2f}\n"
+    f"RSI: {metrics['rsi']:.2f}\n"
+    f"Pre-score reasons: "
+    f"{', '.join(metrics['reasons'])}\n"
+)
+
+response = await asyncio.to_thread(
+    gemini_client.models.generate_content,
+    model=GEMINI_MODEL,
+    contents=[
+        ANALYSIS_PROMPT,
+        context,
+        image_part,
+    ],
+)
+
+text = getattr(
+    response,
+    "text",
+    None,
+)
+
+if not text:
+    raise ValueError(
+        "Gemini returned no text"
+    )
+
+result = extract_json(text)
+
+direction = str(
+    result.get(
+        "direction",
+        "",
+    )
+).upper()
+
+if direction not in {"UP", "DOWN"}:
+    direction = metrics["direction"]
+
+try:
+    confidence = int(
+        float(
+            result.get(
+                "confidence",
+                50,
+            )
+        )
+    )
+except (
+    TypeError,
+    ValueError,
+):
+    confidence = 50
+
+confidence = max(
+    50,
+    min(99, confidence),
 )
 
 try:
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model=GEMINI_MODEL,
-        contents=[
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": prompt
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": base64.b64encode(
-                                image_bytes
-                            ).decode("utf-8"),
-                        }
-                    },
-                ],
-            }
-        ],
-    )
-
-    text = getattr(
-        response,
-        "text",
-        None,
-    )
-
-    if not text:
-        raise RuntimeError(
-            "Gemini returned empty response"
-        )
-
-    text = text.strip()
-
-    if text.startswith("```"):
-        text = text.replace(
-            "```json",
-            "",
-            1,
-        )
-
-        text = text.replace(
-            "```",
-            "",
-        ).strip()
-
-    try:
-        result = json.loads(
-            text
-        )
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-
-        if start < 0 or end <= start:
-            raise RuntimeError(
-                "Gemini did not return valid JSON"
-            )
-
-        result = json.loads(
-            text[start:end + 1]
-        )
-
-    direction = str(
-        result.get(
-            "direction",
-            "",
-        )
-    ).upper()
-
-    if direction not in [
-        "UP",
-        "DOWN",
-    ]:
-        raise RuntimeError(
-            "Gemini returned invalid direction"
-        )
-
-    confidence = int(
-        result.get(
-            "confidence",
-            50,
-        )
-    )
-
-    confidence = max(
-        50,
-        min(
-            confidence,
-            95,
-        ),
-    )
-
     delay = int(
-        result.get(
-            "entry_delay_minutes",
-            1,
-        )
-    )
-
-    if delay not in [1, 2, 3]:
-        delay = 1
-
-    entry_price = float(
-        result.get(
-            "entry_price",
-            0,
-        )
-    )
-
-    cancellation_price = float(
-        result.get(
-            "cancellation_price",
-            0,
-        )
-    )
-
-    if entry_price <= 0:
-        raise RuntimeError(
-            "Gemini returned invalid entry price"
-        )
-
-    if cancellation_price <= 0:
-        raise RuntimeError(
-            "Gemini returned invalid cancellation price"
-        )
-
-    return {
-        "direction": direction,
-        "confidence": confidence,
-        "entry_delay_minutes": delay,
-        "entry_price": entry_price,
-        "cancellation_price": cancellation_price,
-        "reason": str(
+        float(
             result.get(
-                "reason",
-                "Price Action confirmation.",
+                "entry_delay",
+                2,
             )
-        ),
-        "structure": str(
-            result.get(
-                "structure",
-                "NEUTRAL",
-            )
-        ).upper(),
-        "momentum": str(
-            result.get(
-                "momentum",
-                "NEUTRAL",
-            )
-        ).upper(),
-    }
-
-except Exception as e:
-    logger.exception(
-        "Gemini analysis failed for %s",
-        symbol,
+        )
     )
-    raise RuntimeError(
-        f"Gemini analysis failed: {e}"
-    )
-
-def entry_time(
-delay: int,
+except (
+    TypeError,
+    ValueError,
 ):
-now = datetime.now(
-UTC_MINUS_3
+    delay = 2
+
+delay = max(
+    1,
+    min(3, delay),
 )
 
-value = now + timedelta(
-    minutes=delay
-)
+try:
+    entry_price = float(
+        result["entry_price"]
+    )
+except (
+    KeyError,
+    TypeError,
+    ValueError,
+):
+    entry_price = float(
+        metrics["last_price"]
+    )
 
-return value.strftime(
-    "%H:%M"
-)
+try:
+    cancellation = float(
+        result["cancellation_price"]
+    )
+except (
+    KeyError,
+    TypeError,
+    ValueError,
+):
+    cancellation = float(
+        metrics["cancel_price"]
+    )
 
-async def find_best_pair():
-
-logger.info(
-    "Starting pair scan"
-)
-
-timeout = httpx.Timeout(
-    20.0,
-    connect=10.0,
-)
-
-async with httpx.AsyncClient(
-    timeout=timeout
-) as client:
-
-    tasks = [
-        get_forex_data(
-            client,
-            symbol,
-            80,
-        )
-        for symbol in FOREX_PAIRS
+if (
+    direction == "UP"
+    and cancellation >= entry_price
+):
+    cancellation = metrics[
+        "cancel_price"
     ]
 
-    results = await asyncio.gather(
-        *tasks,
-        return_exceptions=True,
-    )
-
-candidates = []
-
-for symbol, data in zip(
-    FOREX_PAIRS,
-    results,
+if (
+    direction == "DOWN"
+    and cancellation <= entry_price
 ):
+    cancellation = metrics[
+        "cancel_price"
+    ]
 
-    if isinstance(
-        data,
-        Exception,
-    ):
-        logger.error(
-            "Error for %s: %s",
-            symbol,
-            data,
-        )
-        continue
-
-    if data is None:
-        continue
-
-    try:
-        candles = make_2m_candles(
-            data
-        )
-
-        score, direction = score_pair(
-            candles
-        )
-
-        candidates.append(
-            {
-                "symbol": symbol,
-                "score": score,
-                "direction": direction,
-                "data": candles,
-            }
-        )
-
-        logger.info(
-            "%s score=%s direction=%s",
-            symbol,
-            score,
-            direction,
-        )
-
-    except Exception as e:
-        logger.exception(
-            "Scoring error for %s: %s",
-            symbol,
-            e,
-        )
-
-if not candidates:
-    raise RuntimeError(
-        "No valid forex data available"
+structure = str(
+    result.get(
+        "market_structure",
+        metrics["structure"],
     )
+).upper()
 
-candidates.sort(
-    key=lambda item: item["score"],
-    reverse=True,
+momentum = str(
+    result.get(
+        "momentum",
+        direction,
+    )
+).upper()
+
+reason = str(
+    result.get(
+        "reason",
+        "Price action confirmation.",
+    )
 )
 
-best = candidates[0]
+return {
+    "direction": direction,
+    "confidence": confidence,
+    "entry_delay": delay,
+    "entry_price": entry_price,
+    "cancellation_price": cancellation,
+    "market_structure": structure,
+    "momentum": momentum,
+    "reason": reason[:500],
+}
 
-logger.info(
-    "Best pair: %s score=%s direction=%s",
-    best["symbol"],
-    best["score"],
-    best["direction"],
+def build_fallback_analysis(
+metrics: dict,
+):
+
+direction = metrics["direction"]
+
+entry = metrics["last_price"]
+
+cancellation = metrics[
+    "cancel_price"
+]
+
+confidence = max(
+    55,
+    min(
+        85,
+        55 + int(
+            metrics["score"] * 4
+        ),
+    ),
 )
 
-return best
+delay = (
+    1
+    if metrics["score"] >= 4
+    else 2
+)
 
-def format_signal(
-symbol: str,
-result: dict,
-):
-direction = result["direction"]
-
-if direction == "UP":
-    direction_text = "🟢 UP — شراء"
-
-    cancel_text = (
-        "إلغاء إذا أغلقت الشمعة تحت "
-        + format_price(
-            result["cancellation_price"]
+return {
+    "direction": direction,
+    "confidence": confidence,
+    "entry_delay": delay,
+    "entry_price": entry,
+    "cancellation_price": cancellation,
+    "market_structure": metrics[
+        "structure"
+    ],
+    "momentum": (
+        "BULLISH"
+        if direction == "UP"
+        else "BEARISH"
+    ),
+    "reason": (
+        "; ".join(
+            metrics["reasons"]
         )
+        or "Price action confirmation."
+    ),
+}
+
+def prepare_metrics(
+df: pd.DataFrame,
+score_info: dict,
+):
+
+last = df.iloc[-1]
+previous = df.iloc[-2]
+
+if score_info["direction"] == "UP":
+
+    cancel_price = min(
+        float(last["low"]),
+        float(previous["low"]),
     )
 
 else:
-    direction_text = "🔴 DOWN — بيع"
 
-    cancel_text = (
-        "إلغاء إذا أغلقت الشمعة فوق "
-        + format_price(
-            result["cancellation_price"]
-        )
+    cancel_price = max(
+        float(last["high"]),
+        float(previous["high"]),
+    )
+
+return {
+    **score_info,
+    "last_price": float(
+        last["close"]
+    ),
+    "cancel_price": cancel_price,
+}
+
+async def find_best_pair():
+
+semaphore = asyncio.Semaphore(
+    MAX_SCAN_CONCURRENCY
+)
+
+async def scan(symbol):
+
+    async with semaphore:
+
+        try:
+
+            df_1m = await get_forex_data(
+                symbol
+            )
+
+            df_2m = make_2m_candles(
+                df_1m
+            )
+
+            if len(df_2m) < 30:
+                return None
+
+            score = score_pair(
+                df_2m
+            )
+
+            metrics = prepare_metrics(
+                df_2m,
+                score,
+            )
+
+            return {
+                "symbol": symbol,
+                "df": df_2m,
+                "metrics": metrics,
+            }
+
+        except Exception as exc:
+
+            logger.warning(
+                "Scan failed for %s: %s",
+                symbol,
+                exc,
+            )
+
+            return None
+
+results = await asyncio.gather(
+    *(
+        scan(pair)
+        for pair in PAIRS
+    )
+)
+
+valid = [
+    item
+    for item in results
+    if item is not None
+]
+
+if not valid:
+    raise RuntimeError(
+        "لم يتم الحصول على بيانات كافية من Twelve Data."
+    )
+
+valid.sort(
+    key=lambda item: (
+        item["metrics"]["score"],
+        item["metrics"]["adx"],
+    ),
+    reverse=True,
+)
+
+return valid[0]
+
+def get_entry_time(
+delay_minutes: int,
+) -> str:
+
+now_utc = datetime.now(
+    timezone.utc
+)
+
+target = (
+    now_utc
+    + timedelta(
+        minutes=delay_minutes
+    )
+)
+
+display_time = target.astimezone(
+    timezone(
+        timedelta(hours=-3)
+    )
+)
+
+return display_time.strftime(
+    "%H:%M:%S"
+)
+
+def format_signal(
+symbol: str,
+analysis: dict,
+) -> str:
+
+direction = analysis[
+    "direction"
+]
+
+if direction == "UP":
+    decision = (
+        "🟢 UP — شراء (Call)"
+    )
+
+    cancellation_text = (
+        "🛑 إلغاء إذا أغلقت شمعة "
+        "تحت "
+        f"{format_price(analysis['cancellation_price'])}"
+    )
+
+else:
+    decision = (
+        "🔴 DOWN — بيع (Put)"
+    )
+
+    cancellation_text = (
+        "🛑 إلغاء إذا أغلقت شمعة "
+        "فوق "
+        f"{format_price(analysis['cancellation_price'])}"
     )
 
 return (
     "🎓 تحليل زينو\n\n"
-    + f"🎯 Confidence: {result['confidence']}%\n"
-    + f"📊 {symbol} · ⏱ 2M\n"
-    + "━━━━━━━━━━━━━━\n\n"
-    + f"🎯 القرار: {direction_text}\n"
-    + f"🕐 وقت الدخول: {entry_time(result['entry_delay_minutes'])}\n"
-    + f"⏳ بعد: {result['entry_delay_minutes']} دقيقة\n\n"
-    + f"💵 سعر الدخول: {format_price(result['entry_price'])}\n"
-    + f"🛑 {cancel_text}\n\n"
-    + f"📈 Market Structure: {result['structure']}\n"
-    + f"⚡ Momentum: {result['momentum']}\n\n"
-    + f"📝 السبب: {result['reason']}"
+    f"🎯 Confidence: "
+    f"{analysis['confidence']}%\n"
+    f"📊 {symbol} · ⏱ 2M\n"
+    "━━━━━━━━━━━━━━\n\n"
+    f"🎯 القرار: {decision}\n"
+    f"🕐 وقت الدخول: "
+    f"{get_entry_time(analysis['entry_delay'])}\n"
+    f"⏳ بعد "
+    f"{analysis['entry_delay']} دقيقة\n\n"
+    f"💵 سعر الدخول: "
+    f"{format_price(analysis['entry_price'])}\n"
+    f"{cancellation_text}\n\n"
+    f"📈 Market Structure: "
+    f"{analysis['market_structure']}\n"
+    f"⚡ Momentum: "
+    f"{analysis['momentum']}\n"
+    f"📝 السبب: "
+    f"{analysis['reason']}"
 )
 
 async def start(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
+
 if not is_owner(update):
-return
+    return
 
 keyboard = [
     [
@@ -1062,61 +1117,69 @@ keyboard = [
     ]
 ]
 
-await update.message.reply_text(
-    "🎓 ZinoQuotexSignalAI",
-    reply_markup=InlineKeyboardMarkup(
-        keyboard
-    ),
-)
+if update.message:
+    await update.message.reply_text(
+        "🎓 ZinoQuotexSignalAI",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
 
 async def get_signal(
 update: Update,
 context: ContextTypes.DEFAULT_TYPE,
 ):
-if not is_owner(update):
-return
 
 query = update.callback_query
 
-await query.answer()
+if query:
 
-message = await query.message.reply_text(
-    "🔎 جاري فحص الأزواج..."
-)
+    if not is_owner(update):
+
+        await query.answer(
+            "غير مسموح.",
+            show_alert=True,
+        )
+
+        return
+
+    await query.answer()
+
+    message = query.message
+
+else:
+
+    if not is_owner(update):
+        return
+
+    message = update.effective_message
+
+if not message:
+    return
 
 try:
+
+    await message.edit_text(
+        "🔎 جاري فحص الأزواج "
+        "واختيار أفضل زوج..."
+    )
 
     best = await find_best_pair()
 
     symbol = best["symbol"]
-    candles = best["data"]
+    df = best["df"]
+    metrics = best["metrics"]
 
     await message.edit_text(
         f"📊 {symbol}\n"
-        "🔎 تم اختيار أفضل زوج بعد فحص الأزواج.\n"
+        "🔎 تم اختيار أفضل زوج "
+        "بعد فحص الأزواج.\n"
         "📈 جاري إنشاء الشارت..."
     )
 
-    chart = await asyncio.to_thread(
+    chart_bytes = await asyncio.to_thread(
         create_chart,
-        candles,
-        symbol,
-    )
-
-    if chart is None:
-        raise RuntimeError(
-            "Chart creation failed"
-        )
-
-    chart_bytes = chart.getvalue()
-
-    if not chart_bytes:
-        raise RuntimeError(
-            "Chart is empty"
-        )
-
-    logger.info(
-        "Chart created for %s",
+        df,
         symbol,
     )
 
@@ -1125,72 +1188,80 @@ try:
         "🧠 جاري تحليل الشارت..."
     )
 
-    result = await analyze_with_gemini(
-        chart_bytes,
+    try:
+
+        analysis = (
+            await analyze_with_gemini(
+                chart_bytes,
+                symbol,
+                metrics,
+            )
+        )
+
+    except Exception as gemini_error:
+
+        logger.exception(
+            "Gemini analysis failed: %s",
+            gemini_error,
+        )
+
+        analysis = (
+            build_fallback_analysis(
+                metrics
+            )
+        )
+
+    caption = format_signal(
         symbol,
+        analysis,
     )
 
-    text = format_signal(
-        symbol,
-        result,
-    )
-
-    await message.delete()
-
-    await query.message.reply_photo(
+    await message.reply_photo(
         photo=io.BytesIO(
             chart_bytes
         ),
-        caption=text,
+        caption=caption,
     )
 
-except Exception as e:
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎯 Get Signal",
+                callback_data="get_signal",
+            )
+        ]
+    ]
+
+    await message.reply_text(
+        "جاهز للإشارة التالية.",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+except Exception as exc:
 
     logger.exception(
-        "Get Signal failed"
-    )
-
-    error = (
-        "❌ حدث خطأ أثناء التحليل:\n\n"
-        + str(e)[:1000]
+        "Get Signal failed: %s",
+        exc,
     )
 
     try:
+
         await message.edit_text(
-            error
+            "❌ حدث خطأ أثناء التحليل:\n\n"
+            f"{str(exc)[:1000]}"
         )
+
     except Exception:
-        await query.message.reply_text(
-            error
-        )
-
-async def handle_text(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE,
-):
-if not is_owner(update):
-return
-
-await update.message.reply_text(
-    "اضغط 🎯 Get Signal للحصول على الإشارة."
-)
-
-async def handle_photo(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE,
-):
-if not is_owner(update):
-return
-
-await update.message.reply_text(
-    "🎯 استخدم Get Signal ليقوم البوت بفحص الأزواج وتحليل الشارت تلقائيًا."
-)
+        pass
 
 async def health(
 request,
 ):
+
 return web.Response(
-text="ZinoQuotexSignalAI is running"
+    text="ZinoQuotexSignalAI is running"
 )
 
 async def start_health_server():
@@ -1207,9 +1278,7 @@ app.router.add_get(
     health,
 )
 
-runner = web.AppRunner(
-    app
-)
+runner = web.AppRunner(app)
 
 await runner.setup()
 
@@ -1222,13 +1291,13 @@ site = web.TCPSite(
 await site.start()
 
 logger.info(
-    "HTTP server started on port %s",
+    "Health server running on port %s",
     PORT,
 )
 
-return runner
-
 async def main():
+
+await start_health_server()
 
 application = (
     Application.builder()
@@ -1250,38 +1319,19 @@ application.add_handler(
     )
 )
 
-application.add_handler(
-    MessageHandler(
-        filters.PHOTO,
-        handle_photo,
-    )
+logger.info(
+    "ZinoQuotexSignalAI bot is starting..."
 )
 
-application.add_handler(
-    MessageHandler(
-        filters.TEXT
-        & ~filters.COMMAND,
-        handle_text,
-    )
-)
+await application.initialize()
 
-health_runner = (
-    await start_health_server()
+await application.start()
+
+await application.updater.start_polling(
+    drop_pending_updates=True
 )
 
 try:
-
-    await application.initialize()
-
-    await application.start()
-
-    await application.updater.start_polling(
-        drop_pending_updates=True
-    )
-
-    logger.info(
-        "ZinoQuotexSignalAI started successfully"
-    )
 
     await asyncio.Event().wait()
 
@@ -1293,15 +1343,5 @@ finally:
 
     await application.shutdown()
 
-    await health_runner.cleanup()
-
 if name == "main":
-
-try:
-    asyncio.run(
-        main()
-    )
-except KeyboardInterrupt:
-    logger.info(
-        "Bot stopped"
-)
+asyncio.run(main())
