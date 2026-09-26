@@ -4,7 +4,8 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -63,12 +64,10 @@ gemini = genai.Client(
 
 
 # =========================================================
-# TIMEZONE UTC-3
+# ALGERIA TIMEZONE
 # =========================================================
 
-UTC_MINUS_3 = timezone(
-    timedelta(hours=-3)
-)
+ALGERIA_TZ = ZoneInfo("Africa/Algiers")
 
 
 # =========================================================
@@ -604,14 +603,32 @@ def format_signal(data):
     if delay > 2:
         delay = 2
 
+    # =====================================================
+    # ALGERIA ENTRY TIME
+    # =====================================================
+    #
+    # Example:
+    # Current time = 08:58:xx
+    #
+    # delay = 1 -> 08:59
+    # delay = 2 -> 09:00
+    #
+    # We first remove seconds, then add the delay.
+    # This guarantees that 1 minute means the next minute.
+    # =====================================================
+
     now = datetime.now(
-        UTC_MINUS_3
+        ALGERIA_TZ
+    )
+
+    current_minute = now.replace(
+        second=0,
+        microsecond=0
     )
 
     entry_time = (
-        now + timedelta(
-            minutes=delay
-        )
+        current_minute
+        + timedelta(minutes=delay)
     )
 
     entry_time_text = (
