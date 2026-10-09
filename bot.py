@@ -4,6 +4,7 @@ import math
 import logging
 import threading
 import asyncio
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +15,7 @@ from google import genai
 from google.genai import types
 
 # ============================================================
-# ZinoProSignalAI - Telegram + MT4 Connector
+# ZinoProSignalAI - MT5/MT4 + Render + Telegram
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -49,6 +50,12 @@ stats = {
     "last_signal": None,
 }
 
+# Prevent duplicate analysis/delivery for the same closed candle.
+signal_lock = threading.Lock()
+signals_in_progress = set()
+processed_signals = {}
+MAX_SIGNAL_CACHE = 1000
+
 
 # ============================================================
 # UTILITIES
@@ -68,11 +75,38 @@ def number(value, default=None):
     return default
 
 
+def timeframe_seconds(timeframe):
+    """Convert MT4/MT5 timeframe strings to seconds."""
+    tf = str(timeframe).strip().upper()
+
+    if tf.startswith("MN"):
+        return 30 * 24 * 60 * 60
+
+    match = re.fullmatch(r"(M|H|D|W)(\d+)", tf)
+    if not match:
+        return 60
+
+    unit, amount = match.groups()
+    amount = int(amount)
+
+    if amount <= 0:
+        return 60
+
+    multipliers = {
+        "M": 60,
+        "H": 3600,
+        "D": 86400,
+        "W": 604800,
+    }
+
+    return amount * multipliers[unit]
+
+
 def normalize_candles(raw):
     if not isinstance(raw, list):
         raise ValueError("candles must be a JSON array")
 
-    candles = []
+    by_time = {}
 
     for item in raw[-200:]:
         if not isinstance(item, dict):
@@ -82,29 +116,40 @@ def normalize_candles(raw):
         h = number(item.get("high"))
         l = number(item.get("low"))
         c = number(item.get("close"))
-        t = number(item.get("time"), 0)
+        t = number(item.get("time"))
 
-        if None in (o, h, l, c):
+        if None in (o, h, l, c, t):
+            continue
+
+        if t <= 0:
             continue
 
         if h < l or h < max(o, c) or l > min(o, c):
             continue
 
-        candles.append({
-            "time": int(t),
+        timestamp = int(t)
+
+        by_time[timestamp] = {
+            "time": timestamp,
             "open": o,
             "high": h,
             "low": l,
             "close": c,
-        })
+        }
+
+    candles = [by_time[t] for t in sorted(by_time)]
 
     if len(candles) < 30:
         raise ValueError(
             f"At least 30 valid candles are required; got {len(candles)}"
         )
 
-    return candles
+    return candles[-200:]
 
+
+# ============================================================
+# INDICATORS
+# ============================================================
 
 def ema(values, period):
     if len(values) < period:
@@ -138,6 +183,7 @@ def rsi(values, period=14):
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
+
         avg_loss = (
             avg_loss * (period - 1) + losses[i]
         ) / period
@@ -179,8 +225,12 @@ def adx_di(candles, period=14):
         up = cur["high"] - prev["high"]
         down = prev["low"] - cur["low"]
 
-        plus_dm.append(up if up > down and up > 0 else 0.0)
-        minus_dm.append(down if down > up and down > 0 else 0.0)
+        plus_dm.append(
+            up if up > down and up > 0 else 0.0
+        )
+        minus_dm.append(
+            down if down > up and down > 0 else 0.0
+        )
 
         trs.append(max(
             cur["high"] - cur["low"],
@@ -191,8 +241,10 @@ def adx_di(candles, period=14):
     tr = sum(trs[:period])
     pdm = sum(plus_dm[:period])
     mdm = sum(minus_dm[:period])
+
     dx_values = []
-    plus_di = minus_di = None
+    plus_di = None
+    minus_di = None
 
     for i in range(period, len(trs)):
         tr = tr - tr / period + trs[i]
@@ -207,19 +259,21 @@ def adx_di(candles, period=14):
         total = plus_di + minus_di
 
         dx_values.append(
-            100 * abs(plus_di - minus_di) / total if total else 0
+            100 * abs(plus_di - minus_di) / total
+            if total else 0
         )
 
-    adx_value = (
-        sum(dx_values[-period:]) / min(period, len(dx_values))
-        if dx_values else None
-    )
+    adx_value = None
+
+    if dx_values:
+        recent_dx = dx_values[-period:]
+        adx_value = sum(recent_dx) / len(recent_dx)
 
     return adx_value, plus_di, minus_di
 
 
 # ============================================================
-# TECHNICAL ANALYSIS
+# MARKET FEATURES
 # ============================================================
 
 def market_features(candles):
@@ -257,6 +311,10 @@ def market_features(candles):
     }
 
 
+# ============================================================
+# FALLBACK ANALYSIS
+# ============================================================
+
 def fallback_signal(f):
     up = 0
     down = 0
@@ -273,6 +331,7 @@ def fallback_signal(f):
         down += 1
 
     r = f["rsi14"]
+
     if r is not None:
         if 50 < r < 68:
             up += 1
@@ -280,12 +339,12 @@ def fallback_signal(f):
             down += 1
 
     wr = f["williams_r14"]
-    if wr is not None:
-        if -80 < wr < -20:
-            if f["close"] > f["previous_close"]:
-                up += 1
-            elif f["close"] < f["previous_close"]:
-                down += 1
+
+    if wr is not None and -80 < wr < -20:
+        if f["close"] > f["previous_close"]:
+            up += 1
+        elif f["close"] < f["previous_close"]:
+            down += 1
 
     pdi = f["plus_di14"]
     mdi = f["minus_di14"]
@@ -298,6 +357,7 @@ def fallback_signal(f):
 
     if f["breakout_up"]:
         up += 2
+
     if f["breakout_down"]:
         down += 2
 
@@ -308,37 +368,58 @@ def fallback_signal(f):
     decision = "UP" if up >= down else "DOWN"
     confidence = min(65, 50 + abs(up - down) * 3)
 
+    # The fallback uses fewer than 18 independent points.
+    # Scale the raw score to the displayed 18-point range.
+    up_score = min(18, round(up * 18 / 9))
+    down_score = min(18, round(down * 18 / 9))
+
     return {
         "decision": decision,
         "confidence": confidence,
-        "up_score": min(18, up),
-        "down_score": min(18, down),
-        "reason": "تقييم فني احتياطي؛ لم يتوفر تحليل Gemini.",
+        "up_score": up_score,
+        "down_score": down_score,
+        "reason": (
+            "تحليل احتياطي مبني على المؤشرات المتاحة؛ "
+            "تعذر الحصول على تحليل Gemini."
+        ),
     }
 
+
+# ============================================================
+# GEMINI ANALYSIS
+# ============================================================
 
 def get_ai_signal(symbol, timeframe, candles, features):
     if gemini_client is None:
         return fallback_signal(features)
 
     prompt = f"""
-You analyze short-expiry binary-options market data cautiously.
-Use only the OHLC candles and calculated indicators provided.
-Chart timeframe: {timeframe}. Intended trade duration: 1 minute.
-Indicators: EMA 9/21, RSI 14, Williams %R 14, ADX 14, +DI and -DI.
-Prioritize price action, structure, breakout quality, momentum,
-candles, then EMA, RSI, Williams %R and ADX/DI.
-Never invent indicator values or claim a guaranteed result.
-Always choose UP or DOWN. If evidence conflicts, cap confidence at 55.
-Do not exceed 80 confidence unless multiple independent factors align.
-Scores must be integers from 0 to 18 and must reflect evidence.
+أنت محلل فني حذر لبيانات شموع MT5 لإشارات قصيرة الأجل.
+استخدم فقط بيانات OHLC والمؤشرات المحسوبة المرفقة.
+لا تخترع أي قيم أو مؤشرات أو أحجام تداول غير موجودة.
 
-Return JSON only with:
-decision, confidence, up_score, down_score, reason, cancellation.
+الإطار الزمني: {timeframe}
+مدة الصفقة المقصودة: دقيقة واحدة.
+المؤشرات: EMA 9/21, RSI 14, Williams %R 14, ADX 14, +DI, -DI.
+
+رتب الأدلة هكذا:
+حركة السعر وبنية السوق، الاختراق، الزخم، الشموع،
+EMA، RSI، Williams %R، ثم ADX/DI.
+
+يجب اختيار UP أو DOWN.
+إذا تعارضت الأدلة، اجعل الثقة منخفضة ولا تبالغ في التقييم.
+الثقة لا تتجاوز 80.
+النقاط أعداد صحيحة من 0 إلى 18، ويجب أن تعكس الأدلة.
+اكتب السبب بالعربية، ولا تدّعِ ضمان الربح.
+لا ترسل مستوى إلغاء؛ سيُحسب من الشمعة المغلقة في البرنامج.
+
+أعد JSON فقط بهذه الحقول:
+decision, confidence, up_score, down_score, reason
 
 Symbol: {symbol}
 Features: {json.dumps(features, separators=(',', ':'))}
-Last 40 candles: {json.dumps(candles[-40:], separators=(',', ':'))}
+Last 40 closed candles:
+{json.dumps(candles[-40:], separators=(',', ':'))}
 """
 
     try:
@@ -357,19 +438,18 @@ Last 40 candles: {json.dumps(candles[-40:], separators=(',', ':'))}
         if decision not in ("UP", "DOWN"):
             raise ValueError("Invalid AI decision")
 
+        confidence = int(number(result.get("confidence"), 55))
+        up_score = int(number(result.get("up_score"), 0))
+        down_score = int(number(result.get("down_score"), 0))
+
         return {
             "decision": decision,
-            "confidence": int(max(
-                50, min(85, number(result.get("confidence"), 55))
-            )),
-            "up_score": int(max(
-                0, min(18, number(result.get("up_score"), 0))
-            )),
-            "down_score": int(max(
-                0, min(18, number(result.get("down_score"), 0))
-            )),
-            "reason": str(result.get("reason", "تحليل فني"))[:250],
-            "cancellation": str(result.get("cancellation", ""))[:150],
+            "confidence": max(50, min(80, confidence)),
+            "up_score": max(0, min(18, up_score)),
+            "down_score": max(0, min(18, down_score)),
+            "reason": str(
+                result.get("reason", "تحليل فني")
+            )[:250],
         }
 
     except Exception:
@@ -378,32 +458,57 @@ Last 40 candles: {json.dumps(candles[-40:], separators=(',', ':'))}
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# SIGNAL TIME AND MESSAGE
 # ============================================================
 
-def format_signal(symbol, timeframe, result, f):
-    now = now_algiers()
-    entry = (now + timedelta(minutes=1)).replace(
-        second=0, microsecond=0
-    )
+def suggested_entry_time(last_candle, timeframe):
+    """
+    Candle timestamps are opening times.
+    The next candle boundary is the first candidate.
+    If that time has already passed, use the next future boundary.
+    """
+    seconds = timeframe_seconds(timeframe)
+    candidate = int(last_candle["time"]) + seconds
+    now_ts = int(now_algiers().timestamp())
+
+    if candidate <= now_ts:
+        candidate = (now_ts // seconds + 1) * seconds
+
+    return datetime.fromtimestamp(candidate, ALGIERS)
+
+
+def price_digits(symbol):
+    symbol = symbol.upper()
+
+    if "JPY" in symbol:
+        return 3
+
+    if any(x in symbol for x in ("XAU", "XAG")):
+        return 2
+
+    return 5
+
+
+def format_signal(symbol, timeframe, result, f, last_candle):
+    entry = suggested_entry_time(last_candle, timeframe)
+    digits = price_digits(symbol)
 
     price = f["close"]
-    digits = 5
-
     decision = result["decision"]
     emoji = "🟢" if decision == "UP" else "🔴"
 
-    cancellation = result.get("cancellation", "").strip()
-
-    if not cancellation:
-        if decision == "UP":
-            cancellation = (
-                f"إلغاء إذا أغلقت شمعة تحت {f['low']:.{digits}f}"
-            )
-        else:
-            cancellation = (
-                f"إلغاء إذا أغلقت شمعة فوق {f['high']:.{digits}f}"
-            )
+    # Cancellation level is deterministic and based on the last
+    # closed candle, not generated by the language model.
+    if decision == "UP":
+        cancellation = (
+            f"إلغاء الفكرة إذا أغلقت شمعة تحت "
+            f"{f['low']:.{digits}f}"
+        )
+    else:
+        cancellation = (
+            f"إلغاء الفكرة إذا أغلقت شمعة فوق "
+            f"{f['high']:.{digits}f}"
+        )
 
     return (
         "🎓 <b>ZinoProSignalAI</b>\n"
@@ -430,7 +535,9 @@ def format_signal(symbol, timeframe, result, f):
 
 async def send_owner(message):
     if telegram_app is None or not OWNER_ID:
-        raise RuntimeError("Telegram bot or OWNER_ID is not configured")
+        raise RuntimeError(
+            "Telegram bot or OWNER_ID is not configured"
+        )
 
     await telegram_app.bot.send_message(
         chat_id=OWNER_ID,
@@ -467,10 +574,14 @@ class Handler(BaseHTTPRequestHandler):
         log.info("HTTP: " + fmt, *args)
 
     def reply(self, status, data):
-        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        raw = json.dumps(
+            data, ensure_ascii=False
+        ).encode("utf-8")
+
         self.send_response(status)
         self.send_header(
-            "Content-Type", "application/json; charset=utf-8"
+            "Content-Type",
+            "application/json; charset=utf-8"
         )
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -483,10 +594,15 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "ZinoProSignalAI",
             })
 
-        return self.reply(404, {"ok": False, "error": "Not found"})
+        return self.reply(404, {
+            "ok": False,
+            "error": "Not found",
+        })
 
     def do_POST(self):
-        if self.path.rstrip("/") not in ("/mt4", "/mt5"):
+        endpoint = self.path.split("?", 1)[0].rstrip("/")
+
+        if endpoint not in ("/mt4", "/mt5"):
             return self.reply(404, {
                 "ok": False,
                 "error": "Unknown endpoint",
@@ -499,7 +615,9 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(
+                self.headers.get("Content-Length", "0")
+            )
         except ValueError:
             length = 0
 
@@ -510,7 +628,9 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(
+                self.rfile.read(length).decode("utf-8")
+            )
         except Exception:
             return self.reply(400, {
                 "ok": False,
@@ -523,18 +643,25 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "JSON object required",
             })
 
-        # Compatible with the supplied EA: API key in both header and JSON.
         header_key = self.headers.get("X-API-Key", "")
         body_key = str(payload.get("api_key", ""))
 
-        if header_key != MT4_API_KEY and body_key != MT4_API_KEY:
+        if (
+            header_key != MT4_API_KEY
+            and body_key != MT4_API_KEY
+        ):
             return self.reply(401, {
                 "ok": False,
                 "error": "API key mismatch",
             })
 
-        symbol = str(payload.get("symbol", "")).strip().upper()
-        timeframe = str(payload.get("timeframe", "M1")).strip().upper()
+        symbol = str(
+            payload.get("symbol", "")
+        ).strip().upper()
+
+        timeframe = str(
+            payload.get("timeframe", "M1")
+        ).strip().upper()
 
         if not symbol or len(symbol) > 40:
             return self.reply(400, {
@@ -543,45 +670,114 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         try:
-            candles = normalize_candles(payload.get("candles"))
-            features = market_features(candles)
-            result = get_ai_signal(
-                symbol, timeframe, candles, features
-            )
-            message = format_signal(
-                symbol, timeframe, result, features
+            candles = normalize_candles(
+                payload.get("candles")
             )
 
-            delivered = send_owner_threadsafe(message)
+            last_candle = candles[-1]
+            candle_time = last_candle["time"]
 
-            with stats_lock:
-                stats["signals"] += 1
-                stats["last_signal"] = {
+            # Include candle timestamp in the key. Repeated requests
+            # for the same symbol/timeframe/candle must not send again.
+            signal_key = (
+                f"{symbol}|{timeframe}|{candle_time}"
+            )
+
+            with signal_lock:
+                cached = processed_signals.get(signal_key)
+
+                if cached is not None:
+                    return self.reply(200, {
+                        "ok": True,
+                        "duplicate": True,
+                        **cached,
+                    })
+
+                if signal_key in signals_in_progress:
+                    return self.reply(200, {
+                        "ok": True,
+                        "duplicate": True,
+                        "processing": True,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    })
+
+                signals_in_progress.add(signal_key)
+
+            try:
+                features = market_features(candles)
+
+                result = get_ai_signal(
+                    symbol,
+                    timeframe,
+                    candles,
+                    features,
+                )
+
+                message = format_signal(
+                    symbol,
+                    timeframe,
+                    result,
+                    features,
+                    last_candle,
+                )
+
+                delivered = send_owner_threadsafe(message)
+
+                if not delivered:
+                    return self.reply(502, {
+                        "ok": False,
+                        "error": "Telegram delivery failed",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    })
+
+                response_data = {
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "decision": result["decision"],
                     "confidence": result["confidence"],
-                    "time": now_algiers().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                    "telegram_delivered": True,
                 }
 
-            return self.reply(200, {
-                "ok": True,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "decision": result["decision"],
-                "confidence": result["confidence"],
-                "telegram_delivered": delivered,
-            })
+                with stats_lock:
+                    stats["signals"] += 1
+                    stats["last_signal"] = {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "decision": result["decision"],
+                        "confidence": result["confidence"],
+                        "candle_time": candle_time,
+                        "time": now_algiers().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    }
+
+                with signal_lock:
+                    processed_signals[signal_key] = response_data
+
+                    # Keep memory usage bounded.
+                    while len(processed_signals) > MAX_SIGNAL_CACHE:
+                        oldest_key = next(iter(processed_signals))
+                        processed_signals.pop(oldest_key, None)
+
+                return self.reply(200, {
+                    "ok": True,
+                    **response_data,
+                })
+
+            finally:
+                with signal_lock:
+                    signals_in_progress.discard(signal_key)
 
         except ValueError as exc:
             return self.reply(400, {
                 "ok": False,
                 "error": str(exc),
             })
+
         except Exception:
-            log.exception("MT4 request failed")
+            log.exception("MT4/MT5 request failed")
             return self.reply(500, {
                 "ok": False,
                 "error": "Internal server error",
@@ -589,7 +785,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_http_server():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        Handler,
+    )
     log.info("HTTP server listening on port %s", PORT)
     server.serve_forever()
 
@@ -605,13 +804,17 @@ def is_owner(update):
     )
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not is_owner(update):
         return
 
     await update.effective_message.reply_text(
         "🎓 ZinoProSignalAI يعمل.\n\n"
         "MT4 endpoint: /mt4\n"
+        "MT5 endpoint: /mt5\n"
         "/stats - الإحصائيات\n"
         "/win - تسجيل ربح\n"
         "/loss - تسجيل خسارة\n"
@@ -619,7 +822,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not is_owner(update):
         return
 
@@ -631,6 +837,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last = s["last_signal"]
 
     last_text = "لا توجد إشارة بعد"
+
     if last:
         last_text = (
             f"{last['symbol']} {last['timeframe']} | "
@@ -641,7 +848,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "📊 ZinoProSignalAI STATS\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📨 الإشارات: {s['signals']}\n"
+        f"📨 الإشارات المرسلة: {s['signals']}\n"
         f"🟢 الأرباح المسجلة: {s['wins']}\n"
         f"🔴 الخسائر المسجلة: {s['losses']}\n"
         f"🎯 نسبة الفوز المسجلة يدويًا: {rate:.1f}%\n"
@@ -649,27 +856,40 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_win(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_win(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not is_owner(update):
         return
 
     with stats_lock:
         stats["wins"] += 1
 
-    await update.effective_message.reply_text("🟢 تم تسجيل ربح.")
+    await update.effective_message.reply_text(
+        "🟢 تم تسجيل ربح."
+    )
 
 
-async def cmd_loss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_loss(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not is_owner(update):
         return
 
     with stats_lock:
         stats["losses"] += 1
 
-    await update.effective_message.reply_text("🔴 تم تسجيل خسارة.")
+    await update.effective_message.reply_text(
+        "🔴 تم تسجيل خسارة."
+    )
 
 
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_reset(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not is_owner(update):
         return
 
@@ -700,16 +920,22 @@ def main():
     global telegram_app
 
     if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN in Render environment variables")
+        raise RuntimeError(
+            "Set BOT_TOKEN in Render environment variables"
+        )
 
     if not OWNER_ID:
-        raise RuntimeError("Set OWNER_ID to your numeric Telegram user ID")
+        raise RuntimeError(
+            "Set OWNER_ID to your numeric Telegram user ID"
+        )
 
     if not MT4_API_KEY:
         log.warning("MT4_API_KEY is missing")
 
     if not GEMINI_API_KEY:
-        log.warning("GEMINI_API_KEY is missing; fallback analysis enabled")
+        log.warning(
+            "GEMINI_API_KEY is missing; fallback analysis enabled"
+        )
 
     threading.Thread(
         target=run_http_server,
@@ -724,13 +950,24 @@ def main():
         .build()
     )
 
-    telegram_app.add_handler(CommandHandler("start", cmd_start))
-    telegram_app.add_handler(CommandHandler("stats", cmd_stats))
-    telegram_app.add_handler(CommandHandler("win", cmd_win))
-    telegram_app.add_handler(CommandHandler("loss", cmd_loss))
-    telegram_app.add_handler(CommandHandler("reset", cmd_reset))
+    telegram_app.add_handler(
+        CommandHandler("start", cmd_start)
+    )
+    telegram_app.add_handler(
+        CommandHandler("stats", cmd_stats)
+    )
+    telegram_app.add_handler(
+        CommandHandler("win", cmd_win)
+    )
+    telegram_app.add_handler(
+        CommandHandler("loss", cmd_loss)
+    )
+    telegram_app.add_handler(
+        CommandHandler("reset", cmd_reset)
+    )
 
     log.info("Starting ZinoProSignalAI")
+
     telegram_app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
